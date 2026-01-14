@@ -73,6 +73,9 @@ def collect_broker_metrics(
     workload = None
     sampler = None
     
+    # 记录开始时间
+    workload_start_time = time.time()
+    
     try:
         print("1. 启动工作负载...")
         workload = WorkloadManager(
@@ -86,8 +89,9 @@ def collect_broker_metrics(
         print()
         
         # 等待负载稳定（50秒）
-        print("2. 等待负载稳定（50秒）...")
-        for i in range(50, 0, -5):
+        stable_wait_seconds = 50
+        print(f"2. 等待负载稳定（{stable_wait_seconds}秒）...")
+        for i in range(stable_wait_seconds, 0, -5):
             print(f"   剩余时间: {i} 秒...", end='\r')
             time.sleep(5)
         print("   负载已稳定" + " " * 20)  # 清除进度行
@@ -113,6 +117,102 @@ def collect_broker_metrics(
         print("4. 收集 Broker 性能指标...")
         broker_metrics = sampler.sample(timeout_sec=12.0)
         print(f"✅ 已收集 {len(broker_metrics)} 条 Broker 指标")
+        print()
+        
+        # 计算实际运行时间
+        actual_runtime_seconds = time.time() - workload_start_time
+        actual_runtime_minutes = actual_runtime_seconds / 60.0
+        
+        # 计算并打印吞吐量
+        print("=" * 60)
+        print("吞吐量统计")
+        print("=" * 60)
+        print(f"实际运行时间: {actual_runtime_seconds:.1f} 秒 ({actual_runtime_minutes:.2f} 分钟)")
+        print(f"注意: Broker的$SYS主题速率指标是基于Broker启动后的累计数据计算的")
+        print(f"      如果运行时间不足对应时间窗口，这些值可能不准确")
+        print()
+        
+        # 消息接收速率
+        messages_received_rate_1min = broker_metrics.get("$SYS/broker/load/messages/received/1min", 0.0)
+        messages_received_rate_5min = broker_metrics.get("$SYS/broker/load/messages/received/5min", 0.0)
+        messages_received_rate_15min = broker_metrics.get("$SYS/broker/load/messages/received/15min", 0.0)
+        messages_received_total = broker_metrics.get("$SYS/broker/messages/received", 0)
+        
+        # 消息发送速率
+        messages_sent_rate_1min = broker_metrics.get("$SYS/broker/load/messages/sent/1min", 0.0)
+        messages_sent_rate_5min = broker_metrics.get("$SYS/broker/load/messages/sent/5min", 0.0)
+        messages_sent_rate_15min = broker_metrics.get("$SYS/broker/load/messages/sent/15min", 0.0)
+        messages_sent_total = broker_metrics.get("$SYS/broker/messages/sent", 0)
+        
+        # 计算数据吞吐量（字节/秒）
+        message_size_bytes = workload_config.message_size
+        bytes_received_rate = messages_received_rate_1min * message_size_bytes
+        bytes_sent_rate = messages_sent_rate_1min * message_size_bytes
+        
+        print(f"消息接收吞吐量:")
+        print(f"  - 1分钟平均速率: {messages_received_rate_1min:.2f} msg/s", end="")
+        if actual_runtime_seconds < 60:
+            print(" ⚠️ (运行时间不足1分钟，值可能不准确)")
+        else:
+            print()
+        if messages_received_rate_5min > 0:
+            print(f"  - 5分钟平均速率: {messages_received_rate_5min:.2f} msg/s", end="")
+            if actual_runtime_seconds < 300:
+                print(" ⚠️ (运行时间不足5分钟，值可能不准确)")
+            else:
+                print()
+        if messages_received_rate_15min > 0:
+            print(f"  - 15分钟平均速率: {messages_received_rate_15min:.2f} msg/s", end="")
+            if actual_runtime_seconds < 900:
+                print(" ⚠️ (运行时间不足15分钟，值可能不准确)")
+            else:
+                print()
+        print(f"  - 累计接收总数: {messages_received_total}")
+        print(f"  - 数据吞吐量: {bytes_received_rate:.2f} bytes/s ({bytes_received_rate/1024:.2f} KB/s, {bytes_received_rate/1024/1024:.2f} MB/s)")
+        print()
+        
+        print(f"消息发送吞吐量:")
+        print(f"  - 1分钟平均速率: {messages_sent_rate_1min:.2f} msg/s", end="")
+        if actual_runtime_seconds < 60:
+            print(" ⚠️ (运行时间不足1分钟，值可能不准确)")
+        else:
+            print()
+        if messages_sent_rate_5min > 0:
+            print(f"  - 5分钟平均速率: {messages_sent_rate_5min:.2f} msg/s", end="")
+            if actual_runtime_seconds < 300:
+                print(" ⚠️ (运行时间不足5分钟，值可能不准确)")
+            else:
+                print()
+        if messages_sent_rate_15min > 0:
+            print(f"  - 15分钟平均速率: {messages_sent_rate_15min:.2f} msg/s", end="")
+            if actual_runtime_seconds < 900:
+                print(" ⚠️ (运行时间不足15分钟，值可能不准确)")
+            else:
+                print()
+        print(f"  - 累计发送总数: {messages_sent_total}")
+        print(f"  - 数据吞吐量: {bytes_sent_rate:.2f} bytes/s ({bytes_sent_rate/1024:.2f} KB/s, {bytes_sent_rate/1024/1024:.2f} MB/s)")
+        print()
+        
+        # 理论吞吐量（基于工作负载配置）
+        # 100个发布者，每个每10ms发布一条消息 = 100 * (1000ms / 10ms) = 10000 msg/s
+        theoretical_rate = workload_config.num_publishers * (1000.0 / workload_config.publisher_interval_ms)
+        print(f"理论吞吐量（基于配置）:")
+        print(f"  - 发布者数量: {workload_config.num_publishers}")
+        print(f"  - 发布间隔: {workload_config.publisher_interval_ms} ms")
+        print(f"  - 理论消息速率: {theoretical_rate:.2f} msg/s")
+        print(f"  - 理论数据速率: {theoretical_rate * message_size_bytes:.2f} bytes/s ({theoretical_rate * message_size_bytes/1024:.2f} KB/s, {theoretical_rate * message_size_bytes/1024/1024:.2f} MB/s)")
+        print()
+        
+        # 吞吐量效率（实际/理论）
+        if theoretical_rate > 0:
+            efficiency_received = (messages_received_rate_1min / theoretical_rate) * 100
+            efficiency_sent = (messages_sent_rate_1min / theoretical_rate) * 100
+            print(f"吞吐量效率:")
+            print(f"  - 接收效率: {efficiency_received:.2f}% ({messages_received_rate_1min:.2f} / {theoretical_rate:.2f})")
+            print(f"  - 发送效率: {efficiency_sent:.2f}% ({messages_sent_rate_1min:.2f} / {theoretical_rate:.2f})")
+            print()
+        
+        print("=" * 60)
         print()
         
         # 收集进程指标

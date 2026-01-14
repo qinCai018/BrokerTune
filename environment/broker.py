@@ -74,6 +74,11 @@ class MosquittoBrokerEnv(gym.Env):
         self._initial_state: Optional[np.ndarray] = None  # D_0: 初始状态性能
         self._need_workload_restart = False  # 标志：是否需要重启工作负载
 
+        # 历史状态跟踪（用于滑动窗口平均）
+        self._throughput_history: List[float] = []  # 最近5步吞吐量
+        self._latency_history: List[float] = []     # 最近5步延迟
+        self._history_window = 5  # 滑动窗口大小
+
     # ---------- 核心 Gym 接口 ----------
     def reset(self, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None) -> Tuple[np.ndarray, Dict[str, Any]]:
         """
@@ -289,9 +294,22 @@ class MosquittoBrokerEnv(gym.Env):
         if self._step_count <= 3 or self._step_count % 20 == 0:
             print(f"[MosquittoBrokerEnv] 开始采样新状态（步数: {self._step_count}）...")
         next_state = self._sample_state()
-        
+
         if self._step_count <= 3 or self._step_count % 20 == 0:
             print(f"[MosquittoBrokerEnv] 新状态采样完成")
+
+        # 更新历史记录（用于滑动窗口）
+        throughput = float(next_state[1])  # msg_rate_norm
+        latency = float(next_state[5])    # latency_p50_norm
+
+        self._throughput_history.append(throughput)
+        self._latency_history.append(latency)
+
+        # 保持历史记录在窗口大小内
+        if len(self._throughput_history) > self._history_window:
+            self._throughput_history.pop(0)
+        if len(self._latency_history) > self._history_window:
+            self._latency_history.pop(0)
         
         # 验证状态有效性（防止NaN/Inf）
         if np.any(np.isnan(next_state)) or np.any(np.isinf(next_state)):
@@ -432,11 +450,23 @@ class MosquittoBrokerEnv(gym.Env):
         # 拼接状态向量
         if self._step_count <= 3 or self._step_count % 20 == 0:
             print(f"[MosquittoBrokerEnv] 构建状态向量...")
+
+        # 获取延迟和队列深度指标（需要扩展）
+        # TODO: 这些指标需要通过工作负载管理器或扩展的采样机制获取
+        latency_p50 = 10.0  # 默认值，单位：毫秒 (TODO: 实现实际测量)
+        latency_p95 = 50.0  # 默认值，单位：毫秒 (TODO: 实现实际测量)
+        queue_depth = 0.0   # 默认值 (TODO: 从 $SYS 主题获取)
+
         state = build_state_vector(
             broker_metrics,
             cpu_ratio,
             mem_ratio,
             ctxt_ratio,
+            latency_p50=latency_p50,
+            latency_p95=latency_p95,
+            queue_depth=queue_depth,
+            throughput_history=self._throughput_history,
+            latency_history=self._latency_history,
         )
         if self._step_count <= 3 or self._step_count % 20 == 0:
             print(f"[MosquittoBrokerEnv] 状态向量构建完成: {state}")
@@ -449,94 +479,130 @@ class MosquittoBrokerEnv(gym.Env):
         next_state: np.ndarray,
     ) -> float:
         """
-        奖励函数设计：
-        考虑每个时间步调优的性能变化和与初始状态的性能变化。
-        
-        定义：
-        - D_0: 初始状态性能（reset 时的性能）
-        - D_{t-1}: 上一个时间步的性能
-        - D_t: 当前时间步的性能
-        
-        奖励函数：
-        reward = α * (D_t - D_{t-1}) + β * (D_t - D_0) - 约束惩罚
-        
-        其中：
-        - (D_t - D_{t-1}): 短期性能改进（相对于上一步）
-        - (D_t - D_0): 长期性能改进（相对于初始状态）
+        改进的奖励函数设计：
+        使用绝对性能奖励 + 相对改进奖励 + 稳定性惩罚的组合
+
+        奖励组成部分：
+        1. 绝对性能奖励：基于当前吞吐量和延迟的绝对表现
+        2. 相对改进奖励：相对于上一步的性能改进
+        3. 稳定性惩罚：惩罚频繁的配置变化
+        4. 资源约束惩罚：防止过度使用资源
+
+        公式：
+        reward = α * throughput_abs + β * (-latency_abs) +
+                 γ * throughput_improvement + δ * (-latency_improvement) +
+                 ε * stability_penalty + ζ * resource_penalty
         """
-        # 提取性能指标 D_t（使用消息速率作为吞吐量的代理）
-        # 如果需要更精确，可以从状态向量中提取多个指标的组合
-        D_t = self._extract_performance_metric(next_state)
-        
-        # 计算相对于上一步的性能变化：D_t - D_{t-1}
+        # 1. 绝对性能奖励
+        throughput_abs = self._extract_throughput(next_state)  # 吞吐量（归一化）
+        latency_abs = self._extract_latency(next_state)       # 延迟（归一化）
+
+        # 2. 相对改进奖励（如果有上一步状态）
+        throughput_improvement = 0.0
+        latency_improvement = 0.0
+
         if prev_state is not None:
-            D_t_minus_1 = self._extract_performance_metric(prev_state)
-            delta_step = D_t - D_t_minus_1  # 短期改进
-        else:
-            delta_step = 0.0  # 第一步没有上一步，变化为 0
-        
-        # 计算相对于初始状态的性能变化：D_t - D_0
-        if self._initial_state is not None:
-            D_0 = self._extract_performance_metric(self._initial_state)
-            delta_initial = D_t - D_0  # 长期改进
-        else:
-            delta_initial = 0.0  # 如果初始状态未设置，设为 0
-        
-        # 权重系数
-        alpha = 10.0  # 短期改进权重（鼓励每一步的改进）
-        beta = 5.0    # 长期改进权重（鼓励整体提升）
-        
-        # 性能改进奖励
-        performance_reward = (
-            alpha * delta_step +      # 奖励短期改进
-            beta * delta_initial      # 奖励长期改进
-        )
-        
-        # 约束惩罚（基于内部指标）
+            prev_throughput = self._extract_throughput(prev_state)
+            prev_latency = self._extract_latency(prev_state)
+
+            throughput_improvement = throughput_abs - prev_throughput
+            latency_improvement = prev_latency - latency_abs  # 延迟降低是改进
+
+        # 3. 稳定性惩罚（避免频繁配置变化）
+        stability_penalty = 0.0
+        if prev_state is not None and len(next_state) >= 11:  # 假设前11维是配置相关的状态
+            # 计算配置变化程度（这里简化，使用吞吐量和延迟的变化作为代理）
+            config_change = abs(throughput_improvement) + abs(latency_improvement)
+            stability_penalty = -2.0 * config_change  # 惩罚大的变化
+
+        # 4. 资源约束惩罚
         cpu_ratio = float(next_state[2])
         mem_ratio = float(next_state[3])
-        
+
         resource_penalty = 0.0
         # CPU 约束：超过 90% 时惩罚
         if cpu_ratio > 0.9:
-            resource_penalty -= 5.0 * (cpu_ratio - 0.9)
+            resource_penalty -= 50.0 * (cpu_ratio - 0.9)
         # 内存约束：超过 90% 时惩罚
         if mem_ratio > 0.9:
-            resource_penalty -= 5.0 * (mem_ratio - 0.9)
-        
-        # 最终奖励
-        reward = performance_reward + resource_penalty
-        
-        # 确保奖励是有效数值
+            resource_penalty -= 50.0 * (mem_ratio - 0.9)
+
+        # 5. 权重系数（调优后的值）
+        alpha = 100.0   # 绝对吞吐量权重
+        beta = 50.0     # 绝对延迟权重（负值）
+        gamma = 50.0    # 吞吐量改进权重
+        delta = 30.0    # 延迟改进权重
+        epsilon = 1.0   # 稳定性惩罚权重
+        zeta = 1.0      # 资源惩罚权重
+
+        # 6. 计算最终奖励
+        performance_reward = (
+            alpha * throughput_abs +                    # 绝对吞吐量奖励
+            beta * (-latency_abs) +                     # 绝对延迟惩罚（延迟越低越好）
+            gamma * throughput_improvement +            # 吞吐量改进奖励
+            delta * latency_improvement +               # 延迟改进奖励
+            epsilon * stability_penalty                 # 稳定性惩罚
+        )
+
+        reward = performance_reward + zeta * resource_penalty
+
+        # 7. 确保奖励是有效数值
         reward = float(reward)
         if np.isnan(reward) or np.isinf(reward):
             reward = 0.0
-        
+
+        if self._step_count <= 3 or self._step_count % 20 == 0:
+            print(f"[Reward] 吞吐量: {throughput_abs:.6f}, 延迟: {latency_abs:.6f}, "
+                  f"改进: 吞吐量{throughput_improvement:+.6f}, 延迟{latency_improvement:+.6f}, "
+                  f"稳定性惩罚: {stability_penalty:.6f}, 资源惩罚: {resource_penalty:.6f}, "
+                  f"总奖励: {reward:.6f}")
+
         return reward
     
-    def _extract_performance_metric(self, state: np.ndarray) -> float:
+    def _extract_throughput(self, state: np.ndarray) -> float:
         """
-        从状态向量中提取性能指标 D。
-        
-        这里使用消息速率作为吞吐量的代理指标。
-        如果需要更精确的性能指标，可以：
-        - 使用多个指标的组合（如加权平均）
-        - 从 broker_metrics 中提取更精确的吞吐量指标
-        
+        从状态向量中提取吞吐量指标。
+
         Args:
             state: 状态向量
-            
+
         Returns:
-            性能指标值（归一化后的）
+            吞吐量值（归一化后的）
         """
-        # 使用消息速率作为性能指标（假设这是吞吐量的代理）
-        msg_rate_norm = float(state[1])
-        
-        # 可选：也可以考虑连接数的影响
-        # clients_norm = float(state[0])
-        # performance = msg_rate_norm + 0.1 * clients_norm
-        
-        return msg_rate_norm
+        return float(state[1])  # msg_rate_norm
+
+    def _extract_latency(self, state: np.ndarray) -> float:
+        """
+        从状态向量中提取延迟指标。
+
+        Args:
+            state: 状态向量
+
+        Returns:
+            延迟值（归一化后的）
+        """
+        return float(state[5])  # latency_p50_norm
+
+    def _extract_performance_metric(self, state: np.ndarray) -> float:
+        """
+        从状态向量中提取综合性能指标 D（向后兼容）。
+
+        现在使用吞吐量和延迟的组合作为性能指标：
+        performance = throughput - latency_penalty
+
+        Args:
+            state: 状态向量
+
+        Returns:
+            综合性能指标值（归一化后的）
+        """
+        throughput = self._extract_throughput(state)
+        latency = self._extract_latency(state)
+
+        # 性能指标 = 吞吐量 - 延迟惩罚
+        performance = throughput - 0.5 * latency  # 延迟权重可以调优
+
+        return performance
     
     def _wait_for_broker_ready(self, max_wait_sec: float = 30.0, check_interval_sec: float = 1.0) -> None:
         """

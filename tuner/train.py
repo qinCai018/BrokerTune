@@ -458,17 +458,19 @@ class ActionThroughputLoggerWrapper(gym.Env):
                 writer = csv.writer(f)
                 # 表头：步数、episode、11个action值（归一化）、11个解码后的配置值、吞吐量、奖励
                 header = (
-                    ["step", "episode"] + 
-                    self.action_names + 
-                    self.knob_names + 
+                    ["step", "episode"] +
+                    self.action_names +
+                    self.knob_names +
                     ["throughput", "reward"]
                 )
+                # 注意：未来可以添加更多状态指标到CSV，如延迟等
                 writer.writerow(header)
                 f.flush()  # 确保立即写入磁盘
                 import os
                 os.fsync(f.fileno())  # 强制同步到磁盘
             print(f"[ActionThroughputLogger] ✅ CSV文件已初始化（覆盖模式）: {self.csv_path}")
-            print(f"[ActionThroughputLogger] CSV包含: action值（归一化）+ 解码后的配置值")
+            print(f"[ActionThroughputLogger] CSV包含: action值（归一化）+ 解码后的配置值 + 吞吐量 + 奖励")
+            print(f"[ActionThroughputLogger] 注意: 状态空间已扩展到10维，包含延迟和历史信息")
         except PermissionError as e:
             print(f"[ActionThroughputLogger] ❌ 无法创建CSV文件（权限不足）: {e}")
             print(f"[ActionThroughputLogger] 文件路径: {self.csv_path}")
@@ -512,16 +514,29 @@ class ActionThroughputLoggerWrapper(gym.Env):
         else:
             obs, reward, terminated, truncated, info = result
             done = terminated or truncated
+
+        # 验证状态向量维度（扩展后应为10维）
+        if len(obs) != 10:
+            print(f"[ActionThroughputLogger] ⚠️  警告: 状态向量维度为{len(obs)}，期望10维")
         
         if self.current_step <= 3 or self.current_step % 20 == 0:
             print(f"[ActionThroughputLogger] 返回值解析完成: reward={reward:.6f}, terminated={terminated}, truncated={truncated}")
         
         # 提取吞吐量（从状态向量的第1维，即消息速率归一化值）
         # state[1] 是 msg_rate_norm，表示消息速率（吞吐量的代理指标）
+        # 注意：状态空间已扩展到10维，第1维仍然是吞吐量
         throughput = float(obs[1]) if len(obs) > 1 else 0.0
         
         if self.current_step <= 3 or self.current_step % 20 == 0:
             print(f"[ActionThroughputLogger] 吞吐量提取完成: {throughput:.10f}")
+            # 显示其他关键指标（如果状态向量足够长）
+            if len(obs) >= 6:
+                latency_p50 = float(obs[5])
+                print(f"[ActionThroughputLogger] P50延迟: {latency_p50:.10f}")
+            if len(obs) >= 10:
+                throughput_avg = float(obs[8])
+                latency_avg = float(obs[9])
+                print(f"[ActionThroughputLogger] 历史平均 - 吞吐量: {throughput_avg:.10f}, 延迟: {latency_avg:.10f}")
         
         # 解码action为实际配置值
         if self.current_step <= 3 or self.current_step % 20 == 0:
@@ -626,13 +641,14 @@ class ActionThroughputLoggerWrapper(gym.Env):
                     writer = csv.writer(f)
                     # 将action转换为列表（如果是numpy数组）
                     action_list = action.tolist() if hasattr(action, 'tolist') else list(action)
-                    # 行数据：步数、episode、11个action值（归一化）、11个解码后的配置值、吞吐量、奖励
-                    row = (
-                        [self.current_step, self.current_episode] + 
-                        action_list + 
-                        decoded_values + 
-                        [throughput, reward]
-                    )
+                # 行数据：步数、episode、11个action值（归一化）、11个解码后的配置值、吞吐量、奖励
+                # 注意：扩展状态向量后，可以添加更多指标到CSV
+                row = (
+                    [self.current_step, self.current_episode] +
+                    action_list +
+                    decoded_values +
+                    [throughput, reward]
+                )
                     writer.writerow(row)
                     f.flush()  # 确保立即写入磁盘
                     import os

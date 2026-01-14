@@ -1,6 +1,6 @@
 import json
 import time
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, List
 
 import numpy as np
 
@@ -212,14 +212,22 @@ def build_state_vector(
     cpu_ratio: float,
     mem_ratio: float,
     ctxt_ratio: float,
+    latency_p50: float = 0.0,
+    latency_p95: float = 0.0,
+    queue_depth: float = 0.0,
+    throughput_history: Optional[List[float]] = None,
+    latency_history: Optional[List[float]] = None,
 ) -> np.ndarray:
     """
     将 Mosquitto 运行指标 + 进程指标拼成状态向量 s_t。
 
-    这里给出一个默认实现：
+    这里给出一个扩展实现：
     - 连接数：从 "$SYS/broker/clients/connected" 获取，若不存在则为 0
     - 消息速率：从 "$SYS/broker/messages/received"、"$SYS/broker/messages/sent"
       等主题中择一（这里简单取 received）
+    - 延迟指标：P50/P95端到端延迟（通过工作负载管理器测量）
+    - 队列深度：Broker内部队列状态
+    - 历史信息：滑动窗口平均值（用于稳定性评估）
     """
     # 这些 key 可根据你的 broker 实际暴露的 $SYS 主题进行调整
     clients_connected = broker_metrics.get(
@@ -248,13 +256,33 @@ def build_state_vector(
     # 如果使用速率指标，已经是msg/s，直接归一化；如果使用累计值，需要除以时间
     msg_rate_norm = messages_received / 10000.0  # 假设 1w msg/s 为 1.0
 
+    # 延迟归一化（假设 100ms 为 1.0）
+    latency_p50_norm = latency_p50 / 100.0
+    latency_p95_norm = latency_p95 / 100.0
+
+    # 队列深度归一化（假设 1000 为 1.0）
+    queue_depth_norm = queue_depth / 1000.0
+
+    # 历史信息：滑动窗口平均值
+    throughput_avg = np.mean(throughput_history) if throughput_history else msg_rate_norm
+    latency_avg = np.mean(latency_history) if latency_history else latency_p50_norm
+
+    # 归一化历史平均值
+    throughput_avg_norm = throughput_avg / 10000.0
+    latency_avg_norm = latency_avg / 100.0
+
     state = np.array(
         [
-            clients_norm,
-            msg_rate_norm,
-            cpu_ratio,
-            mem_ratio,
-            ctxt_ratio,
+            clients_norm,          # [0] 连接数归一化
+            msg_rate_norm,         # [1] 消息速率归一化
+            cpu_ratio,             # [2] CPU使用率
+            mem_ratio,             # [3] 内存使用率
+            ctxt_ratio,            # [4] 上下文切换率
+            latency_p50_norm,      # [5] P50延迟归一化
+            latency_p95_norm,      # [6] P95延迟归一化
+            queue_depth_norm,      # [7] 队列深度归一化
+            throughput_avg_norm,   # [8] 最近5步吞吐量平均
+            latency_avg_norm,      # [9] 最近5步延迟平均
         ],
         dtype=np.float32,
     )

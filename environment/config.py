@@ -97,7 +97,12 @@ class EnvConfig:
     # [2] CPU 使用占比
     # [3] RSS 内存占比
     # [4] 每秒上下文切换数占比
-    state_dim: int = 5
+    # [5] P50 端到端延迟（ms）
+    # [6] P95 端到端延迟（ms）
+    # [7] 队列深度（归一化）
+    # [8] 最近5步平均吞吐量（滑动窗口）
+    # [9] 最近5步平均延迟（滑动窗口）
+    state_dim: int = 10
 
     # 动作向量维度：由 knobs.py 中定义的可调节参数个数决定
     # 当前为 11，对应 BrokerKnobSpace.action_dim

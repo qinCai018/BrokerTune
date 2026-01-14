@@ -313,271 +313,314 @@ def apply_knobs(knobs: Dict[str, Any], dry_run: bool = None, force_restart: bool
     """
     将解码后的 broker 配置真正作用到 Mosquitto。
 
-    默认行为（可通过环境变量调整）：
-      1. 把 knobs 写入一个单独的配置文件：MOSQUITTO_TUNER_CONFIG
-         - 默认：/etc/mosquitto/conf.d/broker_tuner.conf
-      2. 调用 systemctl 重载/重启 mosquitto 服务：
-         - 如果 force_restart=True 或环境变量 BROKER_TUNER_FORCE_RESTART=true：
-           直接使用 systemctl restart mosquitto（完全重启）
-         - 否则优先使用：systemctl reload mosquitto（重载配置）
-         - 如果 reload 失败，回退到：systemctl restart mosquitto
+    新行为（使用独立配置文件）：
+      1. 创建一个完整的独立配置文件，包含所有必需的配置项
+         - 配置文件路径：MOSQUITTO_TUNER_CONFIG（默认：./broker_tuner.conf）
+         - 包含基础配置（listener、allow_anonymous、sys_interval等）
+         - 包含训练过程中调整的配置（knobs中的配置）
+      2. 使用 mosquitto -c xxx.conf 方式启动，而不是 systemctl
+         - 先停止现有的 mosquitto 进程（systemctl stop 或 pkill）
+         - 使用新配置文件启动 mosquitto（后台运行）
+         - 每次配置变化都会完全重启 mosquitto
 
     参数:
       dry_run: 如果为 True，只打印配置信息，不实际写入文件或重启服务。
                如果为 None，则从环境变量 BROKER_TUNER_DRY_RUN 读取（默认为 False）
-      force_restart: 如果为 True，强制使用 restart 而不是 reload。
-                     如果为 None，则从环境变量 BROKER_TUNER_FORCE_RESTART 读取（默认为 False）
-                     某些配置（如 persistence、memory_limit）可能需要完全重启才能生效
-
-    注意：
-      - 这些操作通常需要 root 权限，你需要确保运行该进程的用户有相应权限
-      - 如果你已有自己的管理脚本，也可以忽略这里的实现，改成调用自定义脚本
-      - 在测试模式下（dry_run=True），不会实际修改系统配置，适合观察交互结果
-      - restart 会断开所有现有连接，reload 不会断开连接但某些配置可能不生效
+      force_restart: 已废弃，现在总是完全重启（保留此参数以兼容旧代码）
     
     Returns:
-      bool: 如果使用了 restart（完全重启）返回 True，如果使用了 reload（重载）返回 False
+      bool: 总是返回 True（表示完全重启）
     """
     # 检查是否启用测试模式
     if dry_run is None:
         dry_run = os.environ.get("BROKER_TUNER_DRY_RUN", "false").lower() in ("true", "1", "yes")
     
-    # 检查是否强制使用 restart
-    if force_restart is None:
-        force_restart = os.environ.get("BROKER_TUNER_FORCE_RESTART", "false").lower() in ("true", "1", "yes")
-    
-    # 检查是否需要强制重启（某些配置需要完全重启才能生效）
-    if not force_restart:
-        # 这些配置项需要完全重启才能生效
-        restart_required_configs = ["persistence", "memory_limit", "autosave_interval"]
-        if any(key in knobs for key in restart_required_configs):
-            force_restart = True
-    
-    config_path_str = os.environ.get(
-        "MOSQUITTO_TUNER_CONFIG", "/etc/mosquitto/conf.d/broker_tuner.conf"
-    )
-    config_path = Path(config_path_str)
+    # 配置文件路径（默认使用当前目录下的独立配置文件）
+    # 如果环境变量未设置，使用项目根目录下的 broker_tuner.conf
+    config_path_str = os.environ.get("MOSQUITTO_TUNER_CONFIG")
+    if config_path_str is None:
+        # 尝试从当前工作目录或项目根目录查找
+        current_dir = Path.cwd()
+        # 如果当前目录有 broker_tuner.conf，使用它；否则创建新的
+        if (current_dir / "broker_tuner.conf").exists():
+            config_path_str = str(current_dir / "broker_tuner.conf")
+        else:
+            # 使用项目根目录（假设环境文件在 environment/ 目录下）
+            project_root = Path(__file__).parent.parent
+            config_path_str = str(project_root / "broker_tuner.conf")
+    config_path = Path(config_path_str).resolve()  # 使用绝对路径
 
+    # 构建完整的配置文件内容
+    # 这是一个独立的完整配置文件，包含所有必需的配置项
     lines = [
-        "# 自动生成：BrokerTuner knobs",
+        "# BrokerTuner - 完整的 Mosquitto Broker 配置文件",
+        "# 此文件可以直接用于启动 Broker: mosquitto -c broker_tuner.conf",
+        "# 自动生成，训练过程中会保留最佳效果的配置",
         "# 请不要手工修改，该文件可能会被覆盖",
+        "",
+        "# ============================================",
+        "# 基本配置",
+        "# ============================================",
+        "",
+        "# PID 文件位置（用于跟踪进程，与配置文件在同一目录）",
+        f"pid_file {str(config_path.parent / 'mosquitto_broker_tuner.pid')}",
+        "",
+        "# ============================================",
+        "# 网络监听配置",
+        "# ============================================",
+        "",
+        "# 监听端口 1883（MQTT 标准端口）",
+        "listener 1883",
+        "",
+        "# 允许匿名连接（用于测试和开发）",
+        "allow_anonymous true",
+        "",
+        "# ============================================",
+        "# 持久化配置",
+        "# ============================================",
         "",
     ]
 
     def add_line(key: str, value: Any) -> None:
+        """添加配置行"""
         if isinstance(value, bool):
             v_str = "true" if value else "false"
         else:
             v_str = str(int(value))
         lines.append(f"{key} {v_str}")
 
-    # QoS 相关
+    # 持久化配置（从knobs中读取，如果没有则使用默认值）
+    if "persistence" in knobs:
+        add_line("persistence", knobs["persistence"])
+    else:
+        lines.append("persistence false")
+    
+    lines.append("")
+    lines.append("# ============================================")
+    lines.append("# 日志配置")
+    lines.append("# ============================================")
+    lines.append("")
+    lines.append("# 禁用日志输出（测试环境，减少磁盘IO）")
+    lines.append("log_type none")
+    lines.append("")
+    
+    lines.append("# ============================================")
+    lines.append("# $SYS 主题配置（用于性能监控）")
+    lines.append("# ============================================")
+    lines.append("")
+    lines.append("# 每 10 秒发布一次 $SYS 主题消息")
+    lines.append("sys_interval 10")
+    lines.append("")
+    
+    lines.append("# ============================================")
+    lines.append("# 消息队列配置（训练过程中调整的配置）")
+    lines.append("# ============================================")
+    lines.append("")
+
+    # QoS 相关配置
     if "max_inflight_messages" in knobs:
         add_line("max_inflight_messages", knobs["max_inflight_messages"])
-    if "max_inflight_bytes" in knobs:
+    if "max_inflight_bytes" in knobs and knobs["max_inflight_bytes"] > 0:
         add_line("max_inflight_bytes", knobs["max_inflight_bytes"])
     if "max_queued_messages" in knobs:
         add_line("max_queued_messages", knobs["max_queued_messages"])
-    if "max_queued_bytes" in knobs:
+    if "max_queued_bytes" in knobs and knobs["max_queued_bytes"] > 0:
         add_line("max_queued_bytes", knobs["max_queued_bytes"])
     if "queue_qos0_messages" in knobs:
         add_line("queue_qos0_messages", knobs["queue_qos0_messages"])
 
-    # 内存 / 持久化
-    if "memory_limit" in knobs:
+    # 内存配置
+    if "memory_limit" in knobs and knobs["memory_limit"] > 0:
         add_line("memory_limit", knobs["memory_limit"])
-    if "persistence" in knobs:
-        add_line("persistence", knobs["persistence"])
-    if "autosave_interval" in knobs:
-        # autosave_interval 仅在 persistence=true 时有意义，但这里统一写入
+    if "autosave_interval" in knobs and knobs["autosave_interval"] > 0:
         add_line("autosave_interval", knobs["autosave_interval"])
 
-    # 网络 / 协议
+    # 网络 / 协议配置
     if "set_tcp_nodelay" in knobs:
         add_line("set_tcp_nodelay", knobs["set_tcp_nodelay"])
-    if "max_packet_size" in knobs:
-        max_packet_size = knobs["max_packet_size"]
-        # max_packet_size 为 0 表示无限制，但 Mosquitto 可能不接受 0
-        # 如果为 0，不写入该配置项（使用默认值）
-        if max_packet_size > 0:
-            add_line("max_packet_size", max_packet_size)
-    if "message_size_limit" in knobs:
-        message_size_limit = knobs["message_size_limit"]
-        # message_size_limit 为 0 表示无限制，但 Mosquitto 可能不接受 0
-        # 如果为 0，不写入该配置项（使用默认值）
-        if message_size_limit > 0:
-            add_line("message_size_limit", message_size_limit)
+    if "max_packet_size" in knobs and knobs["max_packet_size"] > 0:
+        # max_packet_size 最小值应为 20
+        max_packet_size = max(20, knobs["max_packet_size"])
+        add_line("max_packet_size", max_packet_size)
+    if "message_size_limit" in knobs and knobs["message_size_limit"] > 0:
+        add_line("message_size_limit", knobs["message_size_limit"])
 
     # 测试模式：只打印配置信息，不实际写入文件
     if dry_run:
         print(f"[DRY RUN] 将应用的配置 knobs: {knobs}")
         print(f"[DRY RUN] 配置文件内容（不会实际写入）:")
         print("\n".join(lines))
-        return False  # 测试模式返回 False（视为 reload）
+        return True  # 测试模式返回 True（视为完全重启）
 
     # 写入配置文件
     try:
         config_path.parent.mkdir(parents=True, exist_ok=True)
         config_content = "\n".join(lines) + "\n"
         config_path.write_text(config_content, encoding="utf-8")
-        
-        # 注意：不进行语法检查，因为 Mosquitto 1.6.9 不支持 -t 选项
-        # systemctl reload/restart 会自动验证配置，如果配置有问题会失败
+        print(f"[apply_knobs] ✅ 配置文件已写入: {config_path}")
     except OSError as exc:
         raise RuntimeError(f"写入 Mosquitto 配置文件失败: {config_path} ({exc})") from exc
 
-    # 尝试重载 / 重启 mosquitto
-    def _run_cmd(cmd: List[str]) -> None:
+    # 停止现有的 mosquitto 进程
+    def _stop_mosquitto() -> None:
+        """停止现有的 mosquitto 进程"""
+        print("[apply_knobs] 停止现有的 mosquitto 进程...")
+        
+        # 方法1: 尝试使用 systemctl stop（如果服务正在运行）
         try:
             result = subprocess.run(
-                cmd,
-                check=False,
+                ["systemctl", "stop", "mosquitto"],
                 capture_output=True,
                 text=True,
-                timeout=30
+                timeout=10
             )
-            # 如果返回码是负数，可能是被信号中断（如SIGINT），这是正常的（用户按Ctrl+C）
-            if result.returncode != 0:
-                # 检查是否是信号中断（负数退出码）
-                if result.returncode < 0:
-                    # 信号中断，可能是用户按Ctrl+C，这是正常的
-                    # 不抛出异常，让上层处理
-                    return
-                error_msg = result.stderr.strip() or result.stdout.strip() or "未知错误"
-                raise subprocess.CalledProcessError(
-                    result.returncode,
-                    cmd,
-                    output=result.stdout,
-                    stderr=result.stderr
-                )
-        except KeyboardInterrupt:
-            # 用户中断，重新抛出让上层处理
-            raise
-        except subprocess.TimeoutExpired:
-            # 超时，抛出异常
-            raise RuntimeError(f"执行命令超时: {' '.join(cmd)}")
-
-    if force_restart:
-        # 强制使用 restart（完全重启）
+            if result.returncode == 0:
+                print("[apply_knobs] ✅ 已通过 systemctl stop 停止 mosquitto 服务")
+                time.sleep(1)  # 等待服务停止
+        except (subprocess.TimeoutExpired, FileNotFoundError, subprocess.CalledProcessError):
+            pass  # systemctl 可能不可用或服务未运行
+        
+        # 方法2: 使用 pkill 停止所有 mosquitto 进程（包括使用 -c 启动的）
         try:
-            _run_cmd(["systemctl", "restart", "mosquitto"])
-            # 等待服务启动
-            time.sleep(2)
-            # 验证服务是否成功启动
-            result = subprocess.run(
-                ["systemctl", "is-active", "mosquitto"],
+            # 先尝试优雅停止（SIGTERM）
+            subprocess.run(
+                ["pkill", "-TERM", "-f", "mosquitto"],
                 capture_output=True,
-                text=True,
                 timeout=5
             )
-            if result.returncode != 0:
-                # 获取详细错误信息
-                journal_result = subprocess.run(
-                    ["journalctl", "-u", "mosquitto.service", "-n", "10", "--no-pager"],
-                    capture_output=True,
-                    text=True,
-                    timeout=5
-                )
-                journal_output = journal_result.stdout if journal_result.returncode == 0 else ""
-                raise RuntimeError(
-                    f"Mosquitto 重启后服务未激活。\n"
-                    f"配置文件: {config_path}\n"
-                    f"请检查配置文件是否有语法错误。\n"
-                    f"最近日志:\n{journal_output}"
-                )
-            return True  # 返回 True 表示使用了 restart
-        except subprocess.CalledProcessError as exc:
-            # 检查是否是信号中断（负数退出码，如SIGINT）
-            if exc.returncode < 0:
-                # 信号中断，可能是用户按Ctrl+C，重新抛出KeyboardInterrupt
-                import signal
-                if exc.returncode == -signal.SIGINT:
-                    raise KeyboardInterrupt("用户中断（Ctrl+C）")
-                else:
-                    # 其他信号，可能是系统问题，抛出RuntimeError
-                    raise RuntimeError(
-                        f"重启 mosquitto 服务时被信号中断 (信号: {abs(exc.returncode)})\n"
-                        f"配置文件: {config_path}\n"
-                        f"这可能是正常的（如用户按Ctrl+C）"
-                    ) from exc
+            time.sleep(2)  # 等待进程退出
             
-            # 获取详细错误信息
-            error_detail = exc.stderr or exc.stdout or str(exc)
-            journal_result = subprocess.run(
-                ["journalctl", "-u", "mosquitto.service", "-n", "10", "--no-pager"],
+            # 检查是否还有进程在运行
+            result = subprocess.run(
+                ["pgrep", "-f", "mosquitto"],
                 capture_output=True,
                 text=True,
-                timeout=5
+                timeout=2
             )
-            journal_output = journal_result.stdout if journal_result.returncode == 0 else ""
-            raise RuntimeError(
-                f"重启 mosquitto 服务失败 (退出码: {exc.returncode})\n"
-                f"错误信息: {error_detail}\n"
-                f"配置文件: {config_path}\n"
-                f"请检查配置文件是否有语法错误。\n"
-                f"最近日志:\n{journal_output}\n"
-                f"提示: 可以手动检查配置文件: cat {config_path}"
-            ) from exc
-        except Exception as exc:
-            raise RuntimeError(
-                f"重启 mosquitto 服务时发生异常: {exc}\n"
-                f"配置文件: {config_path}"
-            ) from exc
-    else:
-        # 优先使用 reload（重载配置，不断开连接）
-        try:
-            _run_cmd(["systemctl", "reload", "mosquitto"])
-            return False  # 返回 False 表示使用了 reload
-        except subprocess.CalledProcessError:
-            # 若 reload 不支持或失败，回退到 restart
-            print("[apply_knobs] reload 失败，尝试使用 restart...")
-            try:
-                _run_cmd(["systemctl", "restart", "mosquitto"])
-                # 等待服务启动
-                time.sleep(2)
-                # 验证服务是否成功启动
-                result = subprocess.run(
-                    ["systemctl", "is-active", "mosquitto"],
+            if result.returncode == 0:
+                # 如果还有进程，强制终止（SIGKILL）
+                print("[apply_knobs] 仍有进程运行，强制终止...")
+                subprocess.run(
+                    ["pkill", "-KILL", "-f", "mosquitto"],
                     capture_output=True,
-                    text=True,
                     timeout=5
                 )
-                if result.returncode != 0:
-                    journal_result = subprocess.run(
-                        ["journalctl", "-u", "mosquitto.service", "-n", "10", "--no-pager"],
+                time.sleep(1)
+            
+            print("[apply_knobs] ✅ 已停止所有 mosquitto 进程")
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            pass
+        
+        # 等待端口1883释放
+        print("[apply_knobs] 等待端口1883释放...")
+        for i in range(10):
+            try:
+                result = subprocess.run(
+                    ["netstat", "-tln"],
+                    capture_output=True,
+                    text=True,
+                    timeout=2
+                )
+                if ":1883" not in result.stdout:
+                    break  # 端口已释放
+            except (subprocess.TimeoutExpired, FileNotFoundError):
+                # 如果 netstat 不可用，尝试使用 ss
+                try:
+                    result = subprocess.run(
+                        ["ss", "-tln"],
                         capture_output=True,
                         text=True,
-                        timeout=5
+                        timeout=2
                     )
-                    journal_output = journal_result.stdout if journal_result.returncode == 0 else ""
-                    raise RuntimeError(
-                        f"Mosquitto 重启后服务未激活。\n"
-                        f"配置文件: {config_path}\n"
-                        f"请检查配置文件是否有语法错误。\n"
-                        f"最近日志:\n{journal_output}"
-                    )
-                return True  # 返回 True 表示使用了 restart
-            except subprocess.CalledProcessError as exc:
-                error_detail = exc.stderr or exc.stdout or str(exc)
-                journal_result = subprocess.run(
-                    ["journalctl", "-u", "mosquitto.service", "-n", "10", "--no-pager"],
+                    if ":1883" not in result.stdout:
+                        break  # 端口已释放
+                except (subprocess.TimeoutExpired, FileNotFoundError):
+                    pass
+            time.sleep(0.5)
+    
+    # 启动 mosquitto（使用独立配置文件）
+    def _start_mosquitto() -> None:
+        """使用独立配置文件启动 mosquitto"""
+        print(f"[apply_knobs] 使用配置文件启动 mosquitto: {config_path}")
+        
+        # 检查 mosquitto 可执行文件是否存在
+        mosquitto_cmd = None
+        for path in ["/usr/sbin/mosquitto", "/usr/bin/mosquitto", "mosquitto"]:
+            try:
+                result = subprocess.run(
+                    ["which", path] if path == "mosquitto" else ["test", "-f", path],
                     capture_output=True,
-                    text=True,
-                    timeout=5
+                    timeout=2
                 )
-                journal_output = journal_result.stdout if journal_result.returncode == 0 else ""
+                if result.returncode == 0 or path == "mosquitto":
+                    mosquitto_cmd = path
+                    break
+            except:
+                continue
+        
+        if mosquitto_cmd is None:
+            # 尝试直接使用 mosquitto（可能在 PATH 中）
+            mosquitto_cmd = "mosquitto"
+        
+        # 启动 mosquitto（后台运行）
+        # -c: 指定配置文件
+        # -d: 后台运行（daemon模式）
+        try:
+            result = subprocess.run(
+                [mosquitto_cmd, "-c", str(config_path), "-d"],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            
+            if result.returncode != 0:
+                error_msg = result.stderr.strip() or result.stdout.strip() or "未知错误"
                 raise RuntimeError(
-                    f"重载/重启 mosquitto 服务失败 (退出码: {exc.returncode})\n"
-                    f"错误信息: {error_detail}\n"
+                    f"启动 mosquitto 失败 (退出码: {result.returncode})\n"
+                    f"错误信息: {error_msg}\n"
                     f"配置文件: {config_path}\n"
                     f"请检查配置文件是否有语法错误。\n"
-                    f"最近日志:\n{journal_output}\n"
-                    f"提示: 可以手动检查配置文件: cat {config_path}"
-                ) from exc
-            except Exception as exc:
-                raise RuntimeError(
-                    f"重启 mosquitto 服务时发生异常: {exc}\n"
-                    f"配置文件: {config_path}"
-                ) from exc
+                    f"提示: 可以手动测试: {mosquitto_cmd} -c {config_path}"
+                )
+            
+            print(f"[apply_knobs] ✅ mosquitto 已启动（后台运行）")
+            
+            # 等待一下，让进程启动
+            time.sleep(2)
+            
+            # 验证进程是否运行
+            result = subprocess.run(
+                ["pgrep", "-f", f"mosquitto.*{config_path.name}"],
+                capture_output=True,
+                text=True,
+                timeout=2
+            )
+            if result.returncode == 0:
+                pid = result.stdout.strip().split()[0]
+                print(f"[apply_knobs] ✅ mosquitto 进程已运行（PID: {pid}）")
+                # 更新环境变量中的PID
+                os.environ["MOSQUITTO_PID"] = pid
+            else:
+                print("[apply_knobs] ⚠️  警告: 无法验证 mosquitto 进程是否运行")
+                
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"启动 mosquitto 超时: {mosquitto_cmd} -c {config_path}")
+        except FileNotFoundError:
+            raise RuntimeError(
+                f"找不到 mosquitto 可执行文件\n"
+                f"请确保已安装 mosquitto: sudo apt install mosquitto"
+            )
+    
+    # 执行停止和启动
+    try:
+        _stop_mosquitto()
+        _start_mosquitto()
+        return True  # 总是返回 True（表示完全重启）
+    except Exception as exc:
+        raise RuntimeError(
+            f"应用配置失败: {exc}\n"
+            f"配置文件: {config_path}\n"
+            f"提示: 可以手动检查配置文件: cat {config_path}"
+        ) from exc
 
 
