@@ -1,0 +1,26 @@
+asn1crypto
+certifi
+cffi
+chardet
+cryptography
+enum34
+futures
+idna
+numpy
+psutil
+pycosat
+pycparser
+pyOpenSSL
+PySocks
+PyYAML
+requests
+ruamel-yaml
+six
+torch
+urllib3
+# Core dependencies for BrokerTuner
+stable-baselines3[extra]
+gymnasium>=0.28.0
+gym  # 保留作为回退选项
+shimmy>=2.0
+paho-mqtt
