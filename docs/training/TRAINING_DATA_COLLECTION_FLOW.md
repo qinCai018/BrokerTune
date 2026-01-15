@@ -4,6 +4,12 @@
 
 本文档详细说明强化学习训练过程中每一步的完整流程，包括训练初始化、工作负载启动、Broker重启、工作负载管理、状态采样、奖励计算和数据记录。
 
+**重要更新**：
+- ✅ 使用**独立完整配置文件**（`environment/config/broker_tuner.conf`）
+- ✅ 使用 **`mosquitto -c`** 方式启动，不再使用 systemctl
+- ✅ 每次训练都完全重启 mosquitto，使用新配置文件
+- ✅ 配置文件包含所有必需的配置项（基于模板文件生成）
+
 ## 完整流程
 
 ### 1. 训练初始化流程
@@ -39,6 +45,8 @@
 │   ├─ 创建 MosquittoBrokerEnv(env_cfg, workload_manager=workload)
 │   │   └─ 传入工作负载管理器，以便Broker重启后自动重启工作负载
 │   └─ 设置动作空间和状态空间
+│       ├─ action_space: Box(11维, [0,1])
+│       └─ observation_space: Box(10维)
 │
 ├─ 1.4 包装环境
 │   ├─ ActionThroughputLoggerWrapper(env, save_path)
@@ -115,81 +123,87 @@ Step N:
 │   │   ├─ 3.2.1 解码Action
 │   │   │   └─ knobs = knob_space.decode_action(action)
 │   │   │       └─ 将11维连续action值 [0,1] 解码为11个配置参数
-│   │   │           ├─ max_inflight_messages: 20 ~ 2000 或 0（unlimited）
+│   │   │           ├─ max_inflight_messages: 0 ~ 2000 或 0（unlimited）
 │   │   │           ├─ max_inflight_bytes: 0 ~ 64MB 或 0（unlimited）
-│   │   │           ├─ max_queued_messages: 1000 ~ 20000 或 0（unlimited）
+│   │   │           ├─ max_queued_messages: 0 ~ 20000 或 0（unlimited）
 │   │   │           ├─ max_queued_bytes: 0 ~ 128MB 或 0（unlimited）
 │   │   │           ├─ queue_qos0_messages: True/False
 │   │   │           ├─ memory_limit: 0 ~ 4GB 或 0（unlimited）
 │   │   │           ├─ persistence: True/False
-│   │   │           ├─ autosave_interval: 60 ~ 3600 或 0（关闭）
+│   │   │           ├─ autosave_interval: 0 ~ 3600 或 0（关闭）
 │   │   │           ├─ set_tcp_nodelay: True/False
 │   │   │           ├─ max_packet_size: 0 ~ 10MB 或 0（unlimited）
 │   │   │           └─ message_size_limit: 0 ~ 10MB 或 0（unlimited）
 │   │   │
 │   │   ├─ 3.2.2 应用配置到Broker（apply_knobs）⭐
 │   │   │   │
-│   │   │   ├─ 3.2.2.1 写入配置文件（覆盖模式）✅
-│   │   │   │   ├─ 配置文件路径: /etc/mosquitto/conf.d/broker_tuner.conf
-│   │   │   │   ├─ 将knobs字典转换为Mosquitto配置格式
-│   │   │   │   │   ├─ 布尔值: True → "true", False → "false"
-│   │   │   │   │   └─ 数值: 直接写入（int转换）
-│   │   │   │   ├─ 写入文件（覆盖模式，每次都是全新的配置）✅
-│   │   │   │   └─ 确保配置文件包含所有新的配置参数 ✅
+│   │   │   ├─ 3.2.2.1 生成完整配置文件 ✅
+│   │   │   │   ├─ 配置文件路径: environment/config/broker_tuner.conf
+│   │   │   │   ├─ 从模板文件读取基础配置（broker_template.conf）
+│   │   │   │   ├─ 模板包含：listener、allow_anonymous、sys_interval等基础配置
+│   │   │   │   ├─ 添加训练过程中调整的配置参数（knobs）
+│   │   │   │   └─ 生成完整的独立配置文件（覆盖模式）✅
 │   │   │   │   └─ 示例配置文件内容:
 │   │   │   │       ```
-│   │   │   │       # 自动生成：BrokerTuner knobs
+│   │   │   │       # BrokerTuner - 完整的 Mosquitto Broker 配置文件
+│   │   │   │       # 此文件可以直接用于启动 Broker: mosquitto -c broker_tuner.conf
+│   │   │   │       
+│   │   │   │       pid_file /tmp/mosquitto_broker_tuner.pid
+│   │   │   │       listener 1883
+│   │   │   │       allow_anonymous true
+│   │   │   │       persistence false
+│   │   │   │       log_type none
+│   │   │   │       sys_interval 10
+│   │   │   │       
+│   │   │   │       # 训练过程中动态调整的配置参数
 │   │   │   │       max_inflight_messages 1360
 │   │   │   │       max_inflight_bytes 58474600
 │   │   │   │       max_queued_messages 8508
 │   │   │   │       ...
 │   │   │   │       ```
 │   │   │   │
-│   │   │   ├─ 3.2.2.2 决定重启方式
-│   │   │   │   ├─ 检查是否需要强制重启
-│   │   │   │   │   └─ 如果包含 persistence、memory_limit、autosave_interval → force_restart = True
-│   │   │   │   └─ 否则优先使用 reload（重载配置）
+│   │   │   ├─ 3.2.2.2 停止现有mosquitto进程 ✅
+│   │   │   │   ├─ 尝试 systemctl stop mosquitto（如果服务正在运行）
+│   │   │   │   ├─ 使用 pkill 停止所有 mosquitto 进程（包括使用 -c 启动的）
+│   │   │   │   │   ├─ 先发送 SIGTERM（优雅停止）
+│   │   │   │   │   └─ 如果未退出，发送 SIGKILL（强制终止）
+│   │   │   │   └─ 等待端口1883释放（最多10次检查，每次0.5秒）
 │   │   │   │
-│   │   │   └─ 3.2.2.3 执行重启/重载（使用新配置）✅
+│   │   │   └─ 3.2.2.3 使用新配置文件启动mosquitto ✅
 │   │   │       │
-│   │   │       ├─ 如果 force_restart = True:
-│   │   │       │   └─ systemctl restart mosquitto
-│   │   │       │       ├─ 执行命令: /usr/sbin/mosquitto -c /etc/mosquitto/mosquitto.conf
-│   │   │       │       │   └─ 指定主配置文件: /etc/mosquitto/mosquitto.conf ✅
-│   │   │       │       ├─ Broker启动时按顺序加载配置文件：
-│   │   │       │       │   ├─ 第一步：加载主配置文件 /etc/mosquitto/mosquitto.conf ✅
-│   │   │       │       │   │   └─ 包含: include_dir /etc/mosquitto/conf.d
-│   │   │       │       │   └─ 第二步：根据 include_dir 指令加载 conf.d 目录下的所有 .conf 文件 ✅
-│   │   │       │       │       └─ 包括 broker_tuner.conf（包含新的knobs）✅
-│   │   │       │       ├─ 验证服务是否成功启动（systemctl is-active mosquitto）
-│   │   │       │       └─ 返回 used_restart = True
+│   │   │       ├─ 查找mosquitto可执行文件
+│   │   │       │   └─ 尝试: /usr/sbin/mosquitto, /usr/bin/mosquitto, mosquitto
 │   │   │       │
-│   │   │       └─ 否则（优先使用reload）:
-│   │   │           ├─ 尝试 systemctl reload mosquitto
-│   │   │           │   ├─ 重载配置（不断开现有连接）
-│   │   │           │   ├─ Broker重新读取配置文件（包含新的knobs）✅
-│   │   │           │   └─ 返回 used_restart = False
-│   │   │           └─ 如果reload失败，回退到 restart
+│   │   │       ├─ 启动命令: mosquitto -c <config_path> -d
+│   │   │       │   ├─ -c: 指定配置文件（独立完整配置文件）
+│   │   │       │   └─ -d: 后台运行（daemon模式）
+│   │   │       │
+│   │   │       ├─ 等待2秒让进程启动
+│   │   │       │
+│   │   │       ├─ 验证进程是否运行
+│   │   │       │   └─ pgrep -f "mosquitto.*broker_tuner.conf"
+│   │   │       │
+│   │   │       └─ 更新环境变量 MOSQUITTO_PID
 │   │   │
 │   │   └─ 3.2.3 保证机制 ✅
-│   │       ├─ ✅ 每次调用apply_knobs都会写入新的配置文件（覆盖模式）
-│   │       ├─ ✅ 配置文件包含当前action解码后的所有配置参数
-│   │       ├─ ✅ systemctl reload/restart会读取新的配置文件
-│   │       ├─ ✅ 如果配置有语法错误，systemctl会失败并抛出异常
-│   │       └─ ✅ Broker启动/重载时会应用配置文件中的所有参数
+│   │       ├─ ✅ 每次调用apply_knobs都会生成新的完整配置文件（覆盖模式）
+│   │       ├─ ✅ 配置文件包含基础配置 + 当前action解码后的所有配置参数
+│   │       ├─ ✅ 使用 mosquitto -c 方式启动，完全独立于系统配置
+│   │       ├─ ✅ 如果配置有语法错误，mosquitto启动会失败并抛出异常
+│   │       └─ ✅ Broker启动时会应用配置文件中的所有参数
 │   │
-│   ├─ 3.3 Broker重启处理（如果used_restart=True）⭐
+│   ├─ 3.3 Broker重启处理（总是完全重启）⭐
 │   │   │
 │   │   ├─ 3.3.1 记录Broker重启信息
 │   │   │   ├─ _broker_restart_steps.append(_step_count)
 │   │   │   └─ _need_workload_restart = True ✅
 │   │   │
-│   │   ├─ 3.3.2 等待Broker就绪
+│   │   ├─ 3.3.2 等待Broker就绪 ⭐
 │   │   │   ├─ _wait_for_broker_ready(max_wait_sec=20秒)
-│   │   │   │   ├─ 检查systemctl is-active mosquitto
-│   │   │   │   ├─ 检查端口1883是否监听
-│   │   │   │   └─ 更新Broker PID
-│   │   │   └─ 最多等待20秒
+│   │   │   │   ├─ 检查systemctl is-active mosquitto（如果使用systemctl）
+│   │   │   │   ├─ 检查端口1883是否监听（netstat/ss -tln）
+│   │   │   │   └─ 更新Broker PID（pgrep -o mosquitto）
+│   │   │   └─ 最多等待20秒（如果端口监听，立即返回）
 │   │   │
 │   │   ├─ 3.3.3 立即重启工作负载 ⭐
 │   │   │   │
@@ -239,36 +253,57 @@ Step N:
 │   │   │   ├─ 读取 /proc/[pid]/status → 内存使用率
 │   │   │   └─ 读取 /proc/[pid]/status → 上下文切换率
 │   │   │
-│   │   └─ 3.4.4 构建状态向量
-│   │       ├─ build_state_vector(broker_metrics, cpu, mem, ctxt)
+│   │   └─ 3.4.4 构建状态向量（10维）
+│   │       ├─ build_state_vector(broker_metrics, cpu, mem, ctxt, ...)
 │   │       │   ├─ [0] 连接数归一化: clients_connected / 1000.0
 │   │       │   ├─ [1] 消息速率归一化: messages_rate_1min / 10000.0
 │   │       │   │   └─ 使用 $SYS/broker/load/messages/received/1min（1分钟平均速率）
 │   │       │   ├─ [2] CPU使用率: cpu_ratio
 │   │       │   ├─ [3] 内存使用率: mem_ratio
-│   │       │   └─ [4] 上下文切换率: ctxt_ratio
-│   │       └─ 返回5维状态向量
+│   │       │   ├─ [4] 上下文切换率: ctxt_ratio
+│   │       │   ├─ [5] P50延迟归一化: latency_p50_norm
+│   │       │   ├─ [6] P95延迟归一化: latency_p95_norm
+│   │       │   ├─ [7] 队列深度归一化: queue_depth_norm
+│   │       │   ├─ [8] 最近5步平均吞吐量: throughput_avg（滑动窗口）
+│   │       │   └─ [9] 最近5步平均延迟: latency_avg（滑动窗口）
+│   │       └─ 返回10维状态向量
 │   │
-│   ├─ 3.5 计算奖励 (_compute_reward)
+│   ├─ 3.5 计算奖励 (_compute_reward) ⭐
 │   │   │
 │   │   ├─ 3.5.1 提取性能指标
-│   │   │   └─ D_t = _extract_performance_metric(next_state)
-│   │   │       └─ D_t = state[1]  # 消息速率归一化值
+│   │   │   ├─ throughput_abs = next_state[1]  # 当前step的吞吐量（归一化）
+│   │   │   └─ latency_abs = next_state[5]     # 当前step的延迟（归一化）
 │   │   │
-│   │   ├─ 3.5.2 计算性能改进
-│   │   │   ├─ delta_step = D_t - D_{t-1}  # 短期改进
-│   │   │   └─ delta_initial = D_t - D_0    # 长期改进
+│   │   ├─ 3.5.2 计算相对改进（如果有上一步状态）
+│   │   │   ├─ prev_throughput = prev_state[1]  # 上一个step的吞吐量
+│   │   │   ├─ prev_latency = prev_state[5]     # 上一个step的延迟
+│   │   │   ├─ throughput_improvement = throughput_abs - prev_throughput
+│   │   │   └─ latency_improvement = prev_latency - latency_abs  # 延迟降低是改进
 │   │   │
-│   │   ├─ 3.5.3 计算性能奖励
-│   │   │   └─ performance_reward = α * delta_step + β * delta_initial
-│   │   │       └─ α = 10.0, β = 5.0
+│   │   ├─ 3.5.3 计算稳定性惩罚
+│   │   │   ├─ config_change = abs(throughput_improvement) + abs(latency_improvement)
+│   │   │   └─ stability_penalty = -2.0 × config_change
 │   │   │
-│   │   ├─ 3.5.4 计算资源惩罚
-│   │   │   ├─ 如果CPU > 90% → 惩罚
-│   │   │   └─ 如果内存 > 90% → 惩罚
+│   │   ├─ 3.5.4 计算资源约束惩罚
+│   │   │   ├─ cpu_ratio = next_state[2]
+│   │   │   ├─ mem_ratio = next_state[3]
+│   │   │   ├─ 如果CPU > 90% → 惩罚: -50.0 × (cpu_ratio - 0.9)
+│   │   │   └─ 如果内存 > 90% → 惩罚: -50.0 × (mem_ratio - 0.9)
 │   │   │
-│   │   └─ 3.5.5 最终奖励
-│   │       └─ reward = performance_reward + resource_penalty
+│   │   ├─ 3.5.5 计算最终奖励
+│   │   │   └─ reward = α × throughput_abs + β × (-latency_abs) +
+│   │   │              γ × throughput_improvement + δ × latency_improvement +
+│   │   │              ε × stability_penalty + ζ × resource_penalty
+│   │   │       └─ 权重系数：
+│   │   │           ├─ α = 30.0   # 绝对吞吐量权重（降低）
+│   │   │           ├─ β = 15.0   # 绝对延迟权重（降低）
+│   │   │           ├─ γ = 150.0  # 吞吐量改进权重（提升）
+│   │   │           ├─ δ = 90.0   # 延迟改进权重（提升）
+│   │   │           ├─ ε = 1.0    # 稳定性惩罚权重
+│   │   │           └─ ζ = 1.0    # 资源惩罚权重
+│   │   │
+│   │   └─ 3.5.6 验证奖励有效性
+│   │       └─ 检查NaN/Inf，如果无效则使用0.0
 │   │
 │   └─ 3.6 返回结果
 │       └─ return (next_state, reward, terminated, truncated, info)
@@ -291,17 +326,17 @@ Step N:
     │   ├─ 获取knob_space（从环境unwrapped）
     │   ├─ knobs = knob_space.decode_action(action)
     │   └─ 提取11个解码后的配置值
-    │       ├─ max_inflight_messages: 20 → 2000
-    │       ├─ max_inflight_bytes: 0 → unlimited
-    │       ├─ max_queued_messages: 1000 → 20000
-    │       ├─ max_queued_bytes: 0 → unlimited
-    │       ├─ queue_qos0_messages: False/True
-    │       ├─ memory_limit: 0 → unlimited
-    │       ├─ persistence: False/True
+    │       ├─ max_inflight_messages: 20 → 2000 或 "unlimited"
+    │       ├─ max_inflight_bytes: 数值 或 "unlimited"
+    │       ├─ max_queued_messages: 1000 → 20000 或 "unlimited"
+    │       ├─ max_queued_bytes: 数值 或 "unlimited"
+    │       ├─ queue_qos0_messages: "True" 或 "False"
+    │       ├─ memory_limit: 数值 或 "unlimited"
+    │       ├─ persistence: "True" 或 "False"
     │       ├─ autosave_interval: 60 → 3600
-    │       ├─ set_tcp_nodelay: False/True
-    │       ├─ max_packet_size: 0 → unlimited
-    │       └─ message_size_limit: 0 → unlimited
+    │       ├─ set_tcp_nodelay: "True" 或 "False"
+    │       ├─ max_packet_size: 数值 或 "unlimited"
+    │       └─ message_size_limit: 数值 或 "unlimited"
     │
     └─ 5.3 写入CSV文件
         ├─ 打开 action_throughput_log.csv（追加模式）
@@ -322,57 +357,103 @@ Step N:
 │              Broker重启后的详细流程（在env.step()中）            │
 └─────────────────────────────────────────────────────────────────┘
 
-当Broker重启时（used_restart=True）：
+当Broker重启时（apply_knobs总是返回True，完全重启）：
 │
 ├─ 步骤1: 记录Broker重启信息
 │   ├─ _broker_restart_steps.append(_step_count)
 │   └─ _need_workload_restart = True ✅
 │
-├─ 步骤2: 等待Broker就绪 ⭐
+├─ 步骤2: 停止现有mosquitto进程 ⭐
 │   │
-│   ├─ 2.1 检查服务状态
+│   ├─ 2.1 尝试systemctl stop（如果服务正在运行）
+│   │   └─ systemctl stop mosquitto
+│   │
+│   ├─ 2.2 使用pkill停止所有mosquitto进程
+│   │   ├─ pkill -TERM -f mosquitto（优雅停止）
+│   │   ├─ 等待2秒进程退出
+│   │   └─ 如果未退出，pkill -KILL -f mosquitto（强制终止）
+│   │
+│   └─ 2.3 等待端口1883释放
+│       └─ 最多等待5秒（10次检查，每次0.5秒）
+│
+├─ 步骤3: 生成完整配置文件 ⭐
+│   │
+│   ├─ 3.1 读取模板文件
+│   │   └─ environment/config/broker_template.conf
+│   │       ├─ 包含基础配置：listener、allow_anonymous、sys_interval等
+│   │       └─ 包含注释说明哪些配置将由训练动态添加
+│   │
+│   ├─ 3.2 添加训练过程中调整的配置参数
+│   │   ├─ 从knobs字典提取配置值
+│   │   ├─ 处理持久化配置（替换模板中的persistence）
+│   │   └─ 添加所有可调参数到配置文件
+│   │
+│   └─ 3.3 写入配置文件（覆盖模式）
+│       └─ environment/config/broker_tuner.conf
+│           └─ 完整的独立配置文件，可直接用于 mosquitto -c 启动
+│
+├─ 步骤4: 使用新配置文件启动mosquitto ⭐
+│   │
+│   ├─ 4.1 查找mosquitto可执行文件
+│   │   └─ 尝试: /usr/sbin/mosquitto, /usr/bin/mosquitto, mosquitto
+│   │
+│   ├─ 4.2 执行启动命令
+│   │   └─ mosquitto -c <config_path> -d
+│   │       ├─ -c: 指定完整配置文件路径
+│   │       └─ -d: 后台运行
+│   │
+│   ├─ 4.3 等待进程启动
+│   │   └─ time.sleep(2秒)
+│   │
+│   └─ 4.4 验证进程运行
+│       ├─ pgrep -f "mosquitto.*broker_tuner.conf"
+│       └─ 更新环境变量 MOSQUITTO_PID
+│
+├─ 步骤5: 等待Broker就绪 ⭐
+│   │
+│   ├─ 5.1 检查服务状态（如果使用systemctl）
 │   │   └─ systemctl is-active mosquitto → active
 │   │
-│   ├─ 2.2 检查端口监听
+│   ├─ 5.2 检查端口监听
 │   │   └─ netstat/ss -tln | grep 1883 → 端口已监听
 │   │
-│   ├─ 2.3 更新Broker PID
+│   ├─ 5.3 更新Broker PID
 │   │   └─ 读取新的PID并更新环境变量
 │   │
-│   └─ 2.4 最多等待20秒
+│   └─ 5.4 最多等待20秒
 │       └─ 如果端口监听，立即返回（不等待最大时间）
 │
-├─ 步骤3: 立即重启工作负载 ⭐
+├─ 步骤6: 立即重启工作负载 ⭐
 │   │
-│   ├─ 3.1 检查工作负载状态
+│   ├─ 6.1 检查工作负载状态
 │   │   └─ workload.is_running() → False（Broker重启导致断开）
 │   │
-│   ├─ 3.2 停止旧进程（如果还在运行）
+│   ├─ 6.2 停止旧进程（如果还在运行）
 │   │   ├─ 遍历所有emqtt_bench进程
 │   │   ├─ 发送SIGTERM信号（Unix）或terminate()（Windows）
 │   │   ├─ 等待5秒进程结束
 │   │   └─ 如果未结束，发送SIGKILL强制终止
 │   │
-│   ├─ 3.3 启动新工作负载
+│   ├─ 6.3 启动新工作负载
 │   │   │
-│   │   ├─ 3.3.1 使用保存的配置
+│   │   ├─ 6.3.1 使用保存的配置
 │   │   │   └─ workload._last_config（包含原配置：100发布者，10订阅者，15ms间隔，512B消息，QoS=1）
 │   │   │
-│   │   ├─ 3.3.2 启动订阅者进程
+│   │   ├─ 6.3.2 启动订阅者进程
 │   │   │   ├─ 构建命令: emqtt_bench sub -h 127.0.0.1 -p 1883 -c 10 -t test/topic -q 1
 │   │   │   ├─ subprocess.Popen()启动进程
 │   │   │   ├─ 检查进程是否立即退出（如果退出则报错）
 │   │   │   └─ 等待1秒（让订阅者连接）
 │   │   │
-│   │   ├─ 3.3.3 启动发布者进程
+│   │   ├─ 6.3.3 启动发布者进程
 │   │   │   ├─ 构建命令: emqtt_bench pub -h 127.0.0.1 -p 1883 -c 100 -t test/topic -q 1 -I 15 -s 512
 │   │   │   ├─ subprocess.Popen()启动进程
 │   │   │   └─ 检查进程是否立即退出（如果退出则报错）
 │   │   │
-│   │   └─ 3.3.4 标记为运行中
+│   │   └─ 6.3.4 标记为运行中
 │   │       └─ workload._is_running = True
 │   │
-│   ├─ 3.4 验证工作负载启动
+│   ├─ 6.4 验证工作负载启动
 │   │   ├─ 等待5秒
 │   │   └─ _verify_messages_sending("test/topic", timeout_sec=5.0)
 │   │       ├─ 创建MQTT客户端
@@ -382,30 +463,30 @@ Step N:
 │   │       ├─ 如果收到消息 → 验证成功 ✅
 │   │       └─ 断开连接
 │   │
-│   └─ 3.5 等待工作负载稳定运行
+│   └─ 6.5 等待工作负载稳定运行
 │       └─ time.sleep(30.0秒)
 │           └─ 确保工作负载稳定运行，消息流量稳定
 │
-├─ 步骤4: 等待$SYS主题发布 ⭐
+├─ 步骤7: 等待$SYS主题发布 ⭐
 │   │
-│   ├─ 4.1 说明
+│   ├─ 7.1 说明
 │   │   └─ Broker重启后，需要等待sys_interval时间才会发布第一个$SYS消息
 │   │       └─ 通常sys_interval=10秒
 │   │
-│   ├─ 4.2 等待时间
+│   ├─ 7.2 等待时间
 │   │   └─ time.sleep(12.0秒)
 │   │       └─ sys_interval（10秒）+ 2秒缓冲
 │   │
-│   └─ 4.3 关键点
+│   └─ 7.3 关键点
 │       └─ 在工作负载稳定后等待，这样$SYS主题会包含工作负载产生的消息 ✅
 │           └─ 采样时能获得准确的吞吐量指标
 │
-└─ 步骤5: 准备采样状态
+└─ 步骤8: 准备采样状态
     │
-    ├─ 5.1 关闭旧MQTT采样器连接
+    ├─ 8.1 关闭旧MQTT采样器连接
     │   └─ 如果存在，关闭并标记为需要重新创建
     │
-    └─ 5.2 清除工作负载重启标志
+    └─ 8.2 清除工作负载重启标志
         └─ _need_workload_restart = False
 ```
 
@@ -465,9 +546,24 @@ T0: 训练脚本启动
 │   │
 │   ├─ T2.1: 解码action → knobs
 │   ├─ T2.2: apply_knobs(knobs) → Broker重启
+│   │   │
+│   │   ├─ T2.2.1: 停止现有mosquitto进程（约3-5秒）
+│   │   │   ├─ systemctl stop mosquitto（如果可用）
+│   │   │   ├─ pkill -TERM -f mosquitto
+│   │   │   └─ 等待端口1883释放
+│   │   │
+│   │   ├─ T2.2.2: 生成完整配置文件（<0.1秒）
+│   │   │   ├─ 读取模板文件
+│   │   │   ├─ 添加训练配置参数
+│   │   │   └─ 写入 environment/config/broker_tuner.conf
+│   │   │
+│   │   └─ T2.2.3: 启动mosquitto（约2-3秒）
+│   │       ├─ mosquitto -c <config_path> -d
+│   │       └─ 验证进程运行
+│   │
 │   │   └─ _need_workload_restart = True ✅
 │   │
-│   ├─ T2.3: 等待Broker就绪（最多20秒）
+│   ├─ T2.3: 等待Broker就绪（最多20秒，通常1-3秒）
 │   │   └─ 检查服务状态和端口监听
 │   │
 │   ├─ T2.4: 立即重启工作负载 ⭐
@@ -487,13 +583,18 @@ T0: 训练脚本启动
 │   │   ├─ 采样12秒，收集51+条指标
 │   │   │   └─ $SYS主题已包含工作负载产生的消息 ✅
 │   │   ├─ 读取进程指标（CPU, MEM, CTXT）
-│   │   └─ 构建状态向量: [0.002, 0.006918, 0.0, 0.0, 0.0]
+│   │   └─ 构建状态向量: [0.002, 0.006918, 0.0, 0.0, 0.0, 0.1, 0.2, 0.0, 0.006, 0.1]
+│   │       └─ 10维状态向量（包含历史信息）
 │   │
 │   ├─ T2.7: 计算奖励
-│   │   ├─ D_t = 0.006918（消息速率归一化值）
-│   │   ├─ delta_step = D_t - D_{t-1}
-│   │   ├─ delta_initial = D_t - D_0
-│   │   └─ reward = 0.019885
+│   │   ├─ throughput_abs = 0.006918（当前step的吞吐量）
+│   │   ├─ prev_throughput = 0.006500（上一个step的吞吐量）
+│   │   ├─ throughput_improvement = 0.000418（改进量）
+│   │   ├─ latency_abs = 0.1（当前step的延迟）
+│   │   ├─ prev_latency = 0.12（上一个step的延迟）
+│   │   ├─ latency_improvement = 0.02（延迟降低）
+│   │   ├─ 计算奖励: 30.0×0.006918 + 15.0×(-0.1) + 150.0×0.000418 + 90.0×0.02 + ...
+│   │   └─ reward = 2.345
 │   │
 │   └─ T2.8: 返回结果
 │       └─ (next_state, reward, terminated, truncated, info)
@@ -516,12 +617,15 @@ T0: 训练脚本启动
 
 ```
 Broker重启后：
+├─ 停止现有进程: 约3-5秒
+├─ 生成配置文件: <0.1秒
+├─ 启动mosquitto: 约2-3秒
 ├─ 等待Broker就绪: 最多20秒（实际通常1-3秒）
 ├─ 重启工作负载: 约1秒（启动进程）
 ├─ 验证工作负载: 5秒
 ├─ 等待工作负载稳定: 30秒
 └─ 等待$SYS主题发布: 12秒（sys_interval=10秒 + 2秒缓冲）
-    └─ 总计: 约68-70秒
+    └─ 总计: 约73-80秒
 ```
 
 ### 2. 工作负载重启时间
@@ -586,7 +690,7 @@ Broker重启后：
 
 4. **性能指标**
    - `throughput`: 消息速率归一化值（state[1]），范围约 0.006 ~ 0.007
-   - `reward`: 奖励值，范围约 0.016 ~ 0.020（第一步可能更高）
+   - `reward`: 奖励值，范围约 -100 ~ +200（取决于性能改进）
 
 ## 配置应用机制详解
 
@@ -615,115 +719,169 @@ Broker重启后：
 │             "message_size_limit": 8637244
 │           }
 │
-├─ 3. 写入配置文件（覆盖模式）✅
-│   └─ /etc/mosquitto/conf.d/broker_tuner.conf
-│       └─ 文件内容（每次都是全新的）:
-│           ```
-│           # 自动生成：BrokerTuner knobs
-│           # 请不要手工修改，该文件可能会被覆盖
-│           
-│           max_inflight_messages 1298
-│           max_inflight_bytes 24369612
-│           max_queued_messages 15111
-│           max_queued_bytes 113009960
-│           queue_qos0_messages false
-│           memory_limit 0
-│           persistence true
-│           autosave_interval 2316
-│           set_tcp_nodelay false
-│           max_packet_size 556371
-│           message_size_limit 8637244
-│           ```
+├─ 3. 生成完整配置文件 ✅
+│   └─ environment/config/broker_tuner.conf
+│       ├─ 从模板文件读取基础配置
+│       │   └─ environment/config/broker_template.conf
+│       │       ├─ listener 1883
+│       │       ├─ allow_anonymous true
+│       │       ├─ sys_interval 10
+│       │       └─ log_type none
+│       │
+│       └─ 添加训练配置参数（覆盖模式）
+│           └─ 文件内容（每次都是全新的完整配置）:
+│               ```
+│               # BrokerTuner - 完整的 Mosquitto Broker 配置文件
+│               # 此文件可以直接用于启动 Broker: mosquitto -c broker_tuner.conf
+│               
+│               pid_file /tmp/mosquitto_broker_tuner.pid
+│               listener 1883
+│               allow_anonymous true
+│               persistence true
+│               log_type none
+│               sys_interval 10
+│               
+│               # 训练过程中动态调整的配置参数
+│               max_inflight_messages 1298
+│               max_inflight_bytes 24369612
+│               max_queued_messages 15111
+│               max_queued_bytes 113009960
+│               queue_qos0_messages false
+│               memory_limit 0
+│               autosave_interval 2316
+│               set_tcp_nodelay false
+│               max_packet_size 556371
+│               message_size_limit 8637244
+│               ```
 │
-└─ 4. 重启/重载Broker（使用新配置）✅
+└─ 4. 停止并重启mosquitto（使用新配置）✅
     │
-    ├─ 4.1 systemctl restart mosquitto
-    │   └─ 执行: /usr/sbin/mosquitto -c /etc/mosquitto/mosquitto.conf
-    │       ├─ 第一步：加载主配置文件 /etc/mosquitto/mosquitto.conf ✅
-    │       │   └─ 包含: include_dir /etc/mosquitto/conf.d
-    │       └─ 第二步：根据 include_dir 指令加载 conf.d 目录下的所有 .conf 文件 ✅
-    │           └─ 包括 broker_tuner.conf（包含新的knobs）✅
+    ├─ 4.1 停止现有进程
+    │   ├─ systemctl stop mosquitto（如果可用）
+    │   └─ pkill -f mosquitto（确保所有进程停止）
     │
-    └─ 4.2 systemctl reload mosquitto
-        └─ 发送HUP信号给Broker进程
-            └─ Broker重新读取配置文件（包括 broker_tuner.conf）✅
-            └─ 应用新的配置参数 ✅
+    └─ 4.2 启动mosquitto
+        └─ mosquitto -c environment/config/broker_tuner.conf -d
+            ├─ 使用独立完整配置文件
+            ├─ 不依赖系统配置文件（/etc/mosquitto/mosquitto.conf）
+            └─ 后台运行
 ```
 
-### 2. 配置文件加载机制
+### 2. 配置文件机制
 
 ```
-Mosquitto配置文件加载顺序（按顺序加载，不是二选一）：
+配置文件系统：
 │
-├─ 1. systemctl启动命令
-│   └─ ExecStart: /usr/sbin/mosquitto -c /etc/mosquitto/mosquitto.conf
-│       └─ 指定主配置文件: /etc/mosquitto/mosquitto.conf ✅
+├─ 模板文件（只读，训练过程中不修改）
+│   └─ environment/config/broker_template.conf
+│       ├─ 包含基础配置：listener、allow_anonymous、sys_interval等
+│       └─ 包含注释说明哪些配置将由训练动态添加
 │
-├─ 2. 第一步：加载主配置文件 ✅
-│   └─ /etc/mosquitto/mosquitto.conf
-│       ├─ 加载主配置文件中的所有配置项
-│       └─ 遇到 include_dir /etc/mosquitto/conf.d 指令
+├─ 训练配置文件（每次训练动态生成）
+│   └─ environment/config/broker_tuner.conf
+│       ├─ 基于模板文件生成
+│       ├─ 添加训练过程中调整的配置参数
+│       ├─ 每次apply_knobs()都会覆盖写入（覆盖模式）
+│       └─ 保存性能指标最优的配置参数值
 │
-├─ 3. 第二步：加载 conf.d 目录下的所有 .conf 文件 ✅
-│   └─ 根据主配置文件中的 include_dir 指令
-│       └─ Broker自动扫描 /etc/mosquitto/conf.d/ 目录
-│           └─ 按字母顺序加载所有 .conf 文件
-│               └─ 包括: broker_tuner.conf ✅
-│
-└─ 4. 最终配置
-    ├─ 主配置文件中的配置项
-    ├─ conf.d 目录下所有 .conf 文件的配置项
-    │   └─ 包括: broker_tuner.conf（包含新的knobs）✅
-    └─ 后加载的配置会覆盖先加载的同名配置项
+└─ 启动方式
+    └─ mosquitto -c environment/config/broker_tuner.conf -d
+        ├─ 使用独立完整配置文件
+        ├─ 不依赖系统配置目录
+        └─ 每次重启都使用最新的配置文件
 ```
 
-**关键点**：
-- ✅ **两者都加载**：先加载主配置文件，再加载 conf.d 目录下的所有 .conf 文件
-- ✅ **加载顺序**：
-  1. 首先加载 `/etc/mosquitto/mosquitto.conf`（主配置文件）
-  2. 遇到 `include_dir /etc/mosquitto/conf.d` 指令时
-  3. 然后加载 `conf.d` 目录下的所有 .conf 文件（按字母顺序）
-- ✅ **配置合并**：所有配置都会被加载，后加载的配置会覆盖先加载的同名配置项
-- ✅ **broker_tuner.conf 被加载**：通过 include_dir 机制自动加载，无需单独指定 ✅
-
-### 3. 重启方式选择
+### 3. 重启方式
 
 ```
-apply_knobs() 决定重启方式：
+apply_knobs() 执行流程：
 │
-├─ 检查配置项
-│   └─ 如果包含: persistence、memory_limit、autosave_interval
-│       └─ force_restart = True
+├─ 1. 停止现有mosquitto进程
+│   ├─ systemctl stop mosquitto（如果可用）
+│   └─ pkill -f mosquitto（确保所有进程停止）
 │
-├─ 如果 force_restart = True:
-│   └─ systemctl restart mosquitto
-│       └─ 完全重启，断开所有连接
-│       └─ 读取新的配置文件 ✅
+├─ 2. 生成完整配置文件
+│   ├─ 读取模板文件
+│   ├─ 添加训练配置参数
+│   └─ 写入 environment/config/broker_tuner.conf（覆盖模式）
 │
-└─ 否则:
-    ├─ 优先: systemctl reload mosquitto
-    │   └─ 重载配置，不断开连接
-    │   └─ 读取新的配置文件 ✅
-    └─ 如果reload失败:
-        └─ 回退到: systemctl restart mosquitto
-            └─ 读取新的配置文件 ✅
+└─ 3. 启动mosquitto
+    └─ mosquitto -c <config_path> -d
+        ├─ 总是完全重启（不再使用reload）
+        ├─ 使用独立完整配置文件
+        └─ 后台运行
 ```
 
 ### 4. 保证机制
 
-- ✅ **每次写入新配置**：`apply_knobs()` 每次调用都会覆盖写入配置文件
+- ✅ **每次生成新配置**：`apply_knobs()` 每次调用都会覆盖写入配置文件
 - ✅ **配置文件包含新action**：配置文件包含当前action解码后的所有配置参数
-- ✅ **Broker启动指定主配置**：`systemctl restart` 执行 `/usr/sbin/mosquitto -c /etc/mosquitto/mosquitto.conf`
-- ✅ **配置加载顺序**：
-  1. 首先加载主配置文件 `/etc/mosquitto/mosquitto.conf` ✅
-  2. 遇到 `include_dir /etc/mosquitto/conf.d` 指令时
-  3. 然后加载 `conf.d` 目录下的所有 .conf 文件（按字母顺序）✅
-- ✅ **两者都加载**：主配置文件和 conf.d 目录下的所有 .conf 文件都会被加载
-- ✅ **配置合并**：后加载的配置会覆盖先加载的同名配置项
-- ✅ **broker_tuner.conf被加载**：通过 include_dir 机制自动加载，无需单独指定 ✅
-- ✅ **Broker读取新配置**：`systemctl reload/restart` 会强制Broker读取新的配置文件
-- ✅ **配置验证**：如果配置有语法错误，systemctl会失败并抛出异常
-- ✅ **配置生效**：Broker启动/重载时会应用配置文件中的所有参数
+- ✅ **独立配置文件**：不依赖系统配置，完全独立
+- ✅ **使用 mosquitto -c 启动**：直接指定配置文件，不依赖systemctl配置
+- ✅ **总是完全重启**：每次配置变化都会完全重启mosquitto
+- ✅ **配置验证**：如果配置有语法错误，mosquitto启动会失败并抛出异常
+- ✅ **配置生效**：Broker启动时会应用配置文件中的所有参数
+- ✅ **保存最优配置**：训练过程中会保留性能指标最优的配置参数值
+
+## 奖励函数详解
+
+### 奖励函数公式
+
+```
+reward = α × throughput_abs + β × (-latency_abs) +
+         γ × throughput_improvement + δ × latency_improvement +
+         ε × stability_penalty + ζ × resource_penalty
+```
+
+### 组成部分
+
+1. **绝对性能奖励**
+   - `throughput_abs`: 当前step的吞吐量（state[1]，归一化）
+   - `latency_abs`: 当前step的延迟（state[5]，归一化）
+   - 权重：α = 30.0, β = 15.0（已降低）
+
+2. **相对改进奖励**
+   - `throughput_improvement = throughput_abs - prev_throughput`
+   - `latency_improvement = prev_latency - latency_abs`（延迟降低是改进）
+   - 权重：γ = 150.0, δ = 90.0（已提升）
+
+3. **稳定性惩罚**
+   - `config_change = abs(throughput_improvement) + abs(latency_improvement)`
+   - `stability_penalty = -2.0 × config_change`
+   - 权重：ε = 1.0
+
+4. **资源约束惩罚**
+   - CPU > 90%: `-50.0 × (cpu_ratio - 0.9)`
+   - 内存 > 90%: `-50.0 × (mem_ratio - 0.9)`
+   - 权重：ζ = 1.0
+
+### 权重系数（当前值）
+
+| 系数 | 值 | 说明 |
+|------|-----|------|
+| α | 30.0 | 绝对吞吐量权重（已降低） |
+| β | 15.0 | 绝对延迟权重（已降低） |
+| γ | 150.0 | 吞吐量改进权重（已提升） |
+| δ | 90.0 | 延迟改进权重（已提升） |
+| ε | 1.0 | 稳定性惩罚权重 |
+| ζ | 1.0 | 资源惩罚权重 |
+
+## 状态向量详解
+
+### 状态向量维度（10维）
+
+| 索引 | 指标 | 说明 | 来源 |
+|------|------|------|------|
+| [0] | 连接数归一化 | clients_connected / 1000.0 | $SYS主题 |
+| [1] | 消息速率归一化 | messages_rate_1min / 10000.0 | $SYS主题 |
+| [2] | CPU使用率 | cpu_ratio | /proc/[pid]/stat |
+| [3] | 内存使用率 | mem_ratio | /proc/[pid]/status |
+| [4] | 上下文切换率 | ctxt_ratio | /proc/[pid]/status |
+| [5] | P50延迟归一化 | latency_p50_norm | 默认值（TODO: 实际测量） |
+| [6] | P95延迟归一化 | latency_p95_norm | 默认值（TODO: 实际测量） |
+| [7] | 队列深度归一化 | queue_depth_norm | 默认值（TODO: 从$SYS主题获取） |
+| [8] | 平均吞吐量 | throughput_avg | 最近5步滑动窗口平均 |
+| [9] | 平均延迟 | latency_avg | 最近5步滑动窗口平均 |
 
 ## 关键保证机制
 
@@ -754,8 +912,17 @@ apply_knobs() 决定重启方式：
 - ✅ **等待Broker就绪**：检查服务状态和端口监听
 - ✅ **等待$SYS主题发布**：确保可以采样指标
 - ✅ **PID更新**：Broker重启后自动更新PID
+- ✅ **独立配置文件**：使用独立完整配置文件，不依赖系统配置
 
-### 5. 数据完整性保证
+### 5. 配置管理保证
+
+- ✅ **独立配置文件**：使用 `environment/config/broker_tuner.conf`，完全独立
+- ✅ **基于模板生成**：从模板文件读取基础配置，添加训练参数
+- ✅ **每次覆盖写入**：每次apply_knobs()都会覆盖写入新配置
+- ✅ **保存最优配置**：训练过程中会保留性能指标最优的配置参数值
+- ✅ **使用 mosquitto -c 启动**：直接指定配置文件，不依赖systemctl
+
+### 6. 数据完整性保证
 
 - ✅ **状态验证**：检查NaN/Inf值
 - ✅ **奖励验证**：确保奖励是有效数值
@@ -775,14 +942,26 @@ apply_knobs() 决定重启方式：
   - ✅ 在工作负载稳定后等待$SYS主题发布，确保$SYS主题包含工作负载产生的消息
   - ✅ 采样时$SYS主题已包含工作负载产生的消息，吞吐量指标准确
 
+### 延迟（Latency）
+
+- **来源**：状态向量的第5维 `state[5]`（P50延迟）
+- **当前状态**：使用默认值（TODO: 实现实际测量）
+- **未来改进**：从工作负载管理器或扩展的采样机制获取
+
 ### 奖励（Reward）
 
 - **组成**：
-  - 性能改进奖励：`α * delta_step + β * delta_initial`
-  - 资源惩罚：CPU/内存超过90%时惩罚
+  - 绝对性能奖励：`α × throughput_abs + β × (-latency_abs)`
+  - 相对改进奖励：`γ × throughput_improvement + δ × latency_improvement`
+  - 稳定性惩罚：`ε × stability_penalty`
+  - 资源惩罚：`ζ × resource_penalty`
 - **权重**：
-  - `α = 10.0`：短期改进权重
-  - `β = 5.0`：长期改进权重
+  - `α = 30.0`：绝对吞吐量权重（已降低）
+  - `β = 15.0`：绝对延迟权重（已降低）
+  - `γ = 150.0`：吞吐量改进权重（已提升）
+  - `δ = 90.0`：延迟改进权重（已提升）
+  - `ε = 1.0`：稳定性惩罚权重
+  - `ζ = 1.0`：资源惩罚权重
 
 ## 故障恢复机制
 
@@ -804,6 +983,12 @@ apply_knobs() 决定重启方式：
 2. **等待**：最多等待20秒
 3. **警告**：如果超时，打印警告但继续执行
 
+### 配置文件错误
+
+1. **检测**：mosquitto启动失败（退出码非0）
+2. **错误信息**：从stderr/stdout获取详细错误
+3. **异常处理**：抛出RuntimeError，包含配置文件路径和错误信息
+
 ## 总结
 
 ### 训练初始化包含：
@@ -823,9 +1008,10 @@ apply_knobs() 决定重启方式：
 1. ✅ **模型预测action**
 2. ✅ **解码action并应用配置到Broker**（使用新的action）⭐
    - 解码action → knobs字典（11个配置参数）
-   - 写入配置文件（覆盖模式，包含新的knobs）✅
-   - 重启/重载Broker（读取新的配置文件）✅
-   - 如果配置变化需要重启 → used_restart = True
+   - 生成完整配置文件（基于模板 + 训练参数）✅
+   - 停止现有mosquitto进程 ✅
+   - 使用新配置文件启动mosquitto（mosquitto -c xxx.conf -d）✅
+   - 总是完全重启（不再使用reload）
 3. ✅ **Broker重启后立即重启工作负载**（使用原配置）
    - 停止旧进程
    - 启动新进程（使用原配置：100发布者，10订阅者，15ms间隔，512B消息，QoS=1）
@@ -835,16 +1021,22 @@ apply_knobs() 决定重启方式：
    - 在工作负载稳定后等待，确保$SYS主题包含工作负载产生的消息
 5. ✅ **采样状态**（51+条Broker指标 + 进程指标）
    - 此时$SYS主题已包含工作负载产生的消息，吞吐量指标准确
-6. ✅ **计算奖励**（性能改进 + 资源约束）
+   - 构建10维状态向量（包含历史信息）
+6. ✅ **计算奖励**（绝对性能 + 相对改进 + 稳定性 + 资源约束）
+   - 更强调相对改进（权重已提升）
+   - 降低绝对性能权重
 7. ✅ **记录数据**（action + 解码值 + 吞吐量 + 奖励）
 
 ### 整个过程确保：
 
 - ✅ **训练开始时工作负载已启动**（100发布者，10订阅者，15ms间隔，512B消息，QoS=1）
-- ✅ **每一步都使用新的action配置Broker**（覆盖写入配置文件，Broker读取新配置）✅
+- ✅ **每一步都使用新的action配置Broker**（生成完整配置文件，使用 mosquitto -c 启动）✅
+- ✅ **使用独立完整配置文件**（environment/config/broker_tuner.conf，不依赖系统配置）✅
+- ✅ **保存最优配置**（训练过程中会保留性能指标最优的配置参数值）✅
 - ✅ **工作负载始终运行**（Broker重启后立即恢复）
 - ✅ **工作负载配置保持不变**（每次重启都使用相同的配置：100发布者，10订阅者，15ms间隔，512B消息，QoS=1）
 - ✅ **启动和重启后都验证**（确保工作负载正常工作）
 - ✅ **正确的采集顺序**（先重启工作负载并等待稳定，再等待$SYS主题发布，最后采样状态）
 - ✅ **$SYS主题包含工作负载消息**（采样时$SYS主题已包含工作负载产生的消息）
 - ✅ **数据完整记录**（每一步的action、配置、吞吐量、奖励）
+- ✅ **奖励函数强调改进**（相对改进权重已提升，绝对性能权重已降低）

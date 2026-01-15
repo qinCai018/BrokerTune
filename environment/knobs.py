@@ -335,51 +335,55 @@ def apply_knobs(knobs: Dict[str, Any], dry_run: bool = None, force_restart: bool
     if dry_run is None:
         dry_run = os.environ.get("BROKER_TUNER_DRY_RUN", "false").lower() in ("true", "1", "yes")
     
-    # 配置文件路径（默认使用当前目录下的独立配置文件）
-    # 如果环境变量未设置，使用项目根目录下的 broker_tuner.conf
+    # 配置文件路径（使用environment/config目录下的独立配置文件）
+    # 默认路径：~/userDir/BrokerTuner/environment/config/broker_tuner.conf
+    # 如果环境变量设置了MOSQUITTO_TUNER_CONFIG，则使用指定的路径
     config_path_str = os.environ.get("MOSQUITTO_TUNER_CONFIG")
     if config_path_str is None:
-        # 尝试从当前工作目录或项目根目录查找
-        current_dir = Path.cwd()
-        # 如果当前目录有 broker_tuner.conf，使用它；否则创建新的
-        if (current_dir / "broker_tuner.conf").exists():
-            config_path_str = str(current_dir / "broker_tuner.conf")
-        else:
-            # 使用项目根目录（假设环境文件在 environment/ 目录下）
-            project_root = Path(__file__).parent.parent
-            config_path_str = str(project_root / "broker_tuner.conf")
+        # 使用environment/config目录下的配置文件
+        # Path(__file__) 指向 ~/userDir/BrokerTuner/environment/knobs.py
+        env_dir = Path(__file__).parent  # environment目录
+        config_dir = env_dir / "config"
+        config_dir.mkdir(parents=True, exist_ok=True)  # 确保目录存在
+        config_path_str = str(config_dir / "broker_tuner.conf")
     config_path = Path(config_path_str).resolve()  # 使用绝对路径
 
-    # 构建完整的配置文件内容
+    # 从模板文件开始构建完整的配置文件内容
     # 这是一个独立的完整配置文件，包含所有必需的配置项
-    lines = [
-        "# BrokerTuner - 完整的 Mosquitto Broker 配置文件",
-        "# 此文件可以直接用于启动 Broker: mosquitto -c broker_tuner.conf",
-        "# 自动生成，训练过程中会保留最佳效果的配置",
-        "# 请不要手工修改，该文件可能会被覆盖",
-        "",
-        "# ============================================",
-        "# 基本配置",
-        "# ============================================",
-        "",
-        "# PID 文件位置（用于跟踪进程，与配置文件在同一目录）",
-        f"pid_file {str(config_path.parent / 'mosquitto_broker_tuner.pid')}",
-        "",
-        "# ============================================",
-        "# 网络监听配置",
-        "# ============================================",
-        "",
-        "# 监听端口 1883（MQTT 标准端口）",
-        "listener 1883",
-        "",
-        "# 允许匿名连接（用于测试和开发）",
-        "allow_anonymous true",
-        "",
-        "# ============================================",
-        "# 持久化配置",
-        "# ============================================",
-        "",
-    ]
+    env_dir = Path(__file__).parent  # environment目录
+    template_path = env_dir / "config" / "broker_template.conf"
+
+    # 读取模板文件
+    try:
+        template_content = template_path.read_text(encoding="utf-8")
+        lines = template_content.splitlines()
+    except FileNotFoundError:
+        # 如果模板文件不存在，使用基础配置
+        print(f"警告: 模板文件 {template_path} 不存在，使用基础配置")
+        lines = [
+            "# BrokerTuner - 完整的 Mosquitto Broker 配置文件",
+            "# 此文件可以直接用于启动 Broker: mosquitto -c broker_tuner.conf",
+            "# 自动生成，训练过程中会保留最佳效果的配置",
+            "# 请不要手工修改，该文件可能会被覆盖",
+            "",
+            "# PID 文件位置（用于跟踪进程）",
+            f"pid_file {str(config_path.parent / 'mosquitto_broker_tuner.pid')}",
+            "",
+            "# 监听端口 1883（MQTT 标准端口）",
+            "listener 1883",
+            "",
+            "# 允许匿名连接（用于测试和开发）",
+            "allow_anonymous true",
+            "",
+            "# 持久化配置",
+            "persistence false",
+            "",
+            "# 日志配置",
+            "log_type none",
+            "",
+            "# $SYS 主题配置",
+            "sys_interval 10",
+        ]
 
     def add_line(key: str, value: Any) -> None:
         """添加配置行"""
@@ -389,31 +393,24 @@ def apply_knobs(knobs: Dict[str, Any], dry_run: bool = None, force_restart: bool
             v_str = str(int(value))
         lines.append(f"{key} {v_str}")
 
-    # 持久化配置（从knobs中读取，如果没有则使用默认值）
+    # 在模板基础上添加训练过程中动态调整的配置参数
+    # 模板文件已经包含了基础配置，这里只添加可调参数
+
+    # 首先处理持久化配置（如果在knobs中指定）
     if "persistence" in knobs:
-        add_line("persistence", knobs["persistence"])
-    else:
-        lines.append("persistence false")
-    
+        # 查找并替换模板中的persistence配置
+        persistence_value = "true" if knobs['persistence'] else "false"
+        for i, line in enumerate(lines):
+            if line.strip().startswith("persistence") and not line.strip().startswith("#"):
+                lines[i] = f"persistence {persistence_value}"
+                break
+        else:
+            # 如果模板中没有，添加一行
+            lines.append(f"persistence {persistence_value}")
+
     lines.append("")
     lines.append("# ============================================")
-    lines.append("# 日志配置")
-    lines.append("# ============================================")
-    lines.append("")
-    lines.append("# 禁用日志输出（测试环境，减少磁盘IO）")
-    lines.append("log_type none")
-    lines.append("")
-    
-    lines.append("# ============================================")
-    lines.append("# $SYS 主题配置（用于性能监控）")
-    lines.append("# ============================================")
-    lines.append("")
-    lines.append("# 每 10 秒发布一次 $SYS 主题消息")
-    lines.append("sys_interval 10")
-    lines.append("")
-    
-    lines.append("# ============================================")
-    lines.append("# 消息队列配置（训练过程中调整的配置）")
+    lines.append("# 训练过程中动态调整的配置参数")
     lines.append("# ============================================")
     lines.append("")
 

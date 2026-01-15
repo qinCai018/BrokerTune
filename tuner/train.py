@@ -649,10 +649,10 @@ class ActionThroughputLoggerWrapper(gym.Env):
                     decoded_values +
                     [throughput, reward]
                 )
-                    writer.writerow(row)
-                    f.flush()  # 确保立即写入磁盘
-                    import os
-                    os.fsync(f.fileno())  # 强制同步到磁盘
+                writer.writerow(row)
+                f.flush()  # 确保立即写入磁盘
+                import os
+                os.fsync(f.fileno())  # 强制同步到磁盘
                 if self.current_step <= 3 or self.current_step % 20 == 0:
                     print(f"[ActionThroughputLogger] CSV写入完成")
             except PermissionError as e:
