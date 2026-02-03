@@ -1,7 +1,7 @@
 """
 模型训练入口：
 - 创建 MosquittoBrokerEnv 环境
-- 使用自定义 Policy 的 DDPG 进行训练
+- 使用默认 MlpPolicy 的 DDPG 进行训练
 - 定期保存模型
 
 使用示例：
@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import signal
 import sys
 import time
@@ -82,32 +83,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--tau",
         type=float,
-        default=0.00001,
-        help="目标网络软更新系数，默认：0.00001",
+        default=0.005,
+        help="目标网络软更新系数，默认：0.005",
     )
     parser.add_argument(
         "--actor-lr",
         type=float,
-        default=0.00001,
-        help="Actor学习率，默认：0.00001",
+        default=0.0001,
+        help="Actor学习率，默认：0.0001",
     )
     parser.add_argument(
         "--critic-lr",
         type=float,
-        default=0.00001,
-        help="Critic学习率，默认：0.00001",
+        default=0.001,
+        help="Critic学习率，默认：0.001",
     )
     parser.add_argument(
         "--gamma",
         type=float,
-        default=0.9,
-        help="折扣因子，默认：0.9",
+        default=0.99,
+        help="折扣因子，默认：0.99",
     )
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=16,
-        help="训练批次大小，默认：16",
+        default=128,
+        help="训练批次大小，默认：128",
     )
     # 工作负载相关参数
     parser.add_argument(
@@ -370,8 +371,6 @@ class ActionThroughputLoggerWrapper(gym.Env):
     将数据保存到CSV文件中
     
     继承自gym.Env以确保与Monitor兼容
-    
-    特殊处理：第一步使用默认配置的action
     """
     def __init__(self, env, save_path: str, log_interval: int = 1):
         super().__init__()
@@ -389,25 +388,8 @@ class ActionThroughputLoggerWrapper(gym.Env):
         self.current_episode = 0
         self.current_step = 0
         
-        # 标记是否是第一步（每个episode的第一步使用默认action）
-        self._is_first_step = True
-        
-        # 获取默认action（对应Mosquitto默认配置）
-        self._default_action = None
-        # 尝试获取knob_space（可能需要unwrapped）
-        env_for_knob_space = env
-        for _ in range(5):  # 最多尝试5层
-            if hasattr(env_for_knob_space, 'knob_space'):
-                self._default_action = env_for_knob_space.knob_space.get_default_action()
-                self._cached_knob_space = env_for_knob_space.knob_space  # 缓存knob_space
-                print(f"[ActionThroughputLogger] 已获取默认action（对应Mosquitto默认配置）")
-                break
-            elif hasattr(env_for_knob_space, 'unwrapped'):
-                env_for_knob_space = env_for_knob_space.unwrapped
-            elif hasattr(env_for_knob_space, 'env'):
-                env_for_knob_space = env_for_knob_space.env
-            else:
-                break
+        # 缓存 knob_space 引用（在 step 中惰性初始化）
+        self._cached_knob_space = None
         
         # 动作名称（11维）- 归一化的action值
         self.action_names = [
@@ -438,6 +420,22 @@ class ActionThroughputLoggerWrapper(gym.Env):
             "decoded_max_packet_size",
             "decoded_message_size_limit",
         ]
+
+        # $SYS 关键指标（用于诊断吞吐来源）
+        self.sys_metric_names = [
+            "sys_clients_connected",
+            "sys_msgs_received_1min",
+            "sys_msgs_received_1min_per_sec",
+            "sys_msgs_received_total",
+            "sys_msgs_received_rate",
+        ]
+        self.sys_metric_keys = [
+            "$SYS/broker/clients/connected",
+            "$SYS/broker/load/messages/received/1min",
+            "$SYS/broker/load/messages/received/1min_per_sec",
+            "$SYS/broker/messages/received",
+            "$SYS/broker/messages/received_rate",
+        ]
         
         # 初始化CSV文件，写入表头
         self._init_csv()
@@ -461,6 +459,7 @@ class ActionThroughputLoggerWrapper(gym.Env):
                     ["step", "episode"] +
                     self.action_names +
                     self.knob_names +
+                    self.sys_metric_names +
                     ["throughput", "reward"]
                 )
                 # 注意：未来可以添加更多状态指标到CSV，如延迟等
@@ -482,18 +481,11 @@ class ActionThroughputLoggerWrapper(gym.Env):
         """重置环境，开始新episode"""
         self.current_episode += 1
         self.current_step = 0
-        self._is_first_step = True  # 标记为第一步，将使用默认action
         return self.env.reset(**kwargs)
     
     def step(self, action):
         """执行一步，记录action和吞吐量"""
         self.current_step += 1
-        
-        # 第一步使用默认action（对应Mosquitto默认配置）
-        if self._is_first_step and self._default_action is not None:
-            print(f"[ActionThroughputLogger] 第一步使用默认配置action（episode {self.current_episode}）")
-            action = self._default_action.copy()
-            self._is_first_step = False
         
         # 执行环境step
         if self.current_step <= 3 or self.current_step % 20 == 0:
@@ -501,7 +493,12 @@ class ActionThroughputLoggerWrapper(gym.Env):
         result = self.env.step(action)
         
         # 根据log_interval决定是否记录日志
+        # 默认log_interval=1，表示每步都记录
         should_log = (self.current_step % self.log_interval == 0) or (self.current_step <= 3)
+        
+        # 每步都记录（如果log_interval=1）
+        if self.log_interval == 1 and self.current_step % 100 == 0:
+            print(f"[ActionThroughputLogger] 已记录 {self.current_step} 步数据到CSV（episode {self.current_episode}）")
         
         if self.current_step <= 3 or self.current_step % 20 == 0:
             print(f"[ActionThroughputLogger] env.step() 完成，解析返回值...")
@@ -547,7 +544,7 @@ class ActionThroughputLoggerWrapper(gym.Env):
         try:
             # 获取knob_space（可能被Monitor包装，需要unwrapped）
             # 使用缓存避免每次都查找，并在初始化时保存knob_space引用
-            if not hasattr(self, '_cached_knob_space'):
+            if self._cached_knob_space is None:
                 if self.current_step <= 3:
                     print(f"[ActionThroughputLogger] 首次查找knob_space...")
                 env_with_knob_space = self.env
@@ -631,30 +628,65 @@ class ActionThroughputLoggerWrapper(gym.Env):
             traceback.print_exc()
             decoded_values = ["unlimited", "unlimited", "unlimited", "unlimited", "False", 
                              "unlimited", "False", "1800", "False", "unlimited", "unlimited"]  # 如果解码失败，使用默认值填充
+
+        # 读取最近一次 broker $SYS 指标
+        sys_values = []
+        try:
+            metrics_env = self.env
+            max_unwrap_depth = 10
+            unwrap_count = 0
+            last_env = None
+            while unwrap_count < max_unwrap_depth:
+                if metrics_env is last_env:
+                    break
+                last_env = metrics_env
+                if hasattr(metrics_env, "get_last_broker_metrics"):
+                    break
+                if hasattr(metrics_env, "unwrapped"):
+                    metrics_env = metrics_env.unwrapped
+                    unwrap_count += 1
+                elif hasattr(metrics_env, "env"):
+                    metrics_env = metrics_env.env
+                    unwrap_count += 1
+                else:
+                    break
+            if hasattr(metrics_env, "get_last_broker_metrics"):
+                metrics = metrics_env.get_last_broker_metrics()
+            elif hasattr(metrics_env, "_last_broker_metrics"):
+                metrics = metrics_env._last_broker_metrics
+            else:
+                metrics = {}
+        except Exception:
+            metrics = {}
+
+        for key in self.sys_metric_keys:
+            value = metrics.get(key)
+            sys_values.append(value if value is not None else "")
         
         # 记录到CSV文件（根据log_interval决定是否记录）
         if should_log:
             if self.current_step <= 3 or self.current_step % 20 == 0:
                 print(f"[ActionThroughputLogger] 开始写入CSV文件...")
             try:
-                with open(self.csv_path, 'a', newline='') as f:
-                    writer = csv.writer(f)
-                    # 将action转换为列表（如果是numpy数组）
-                    action_list = action.tolist() if hasattr(action, 'tolist') else list(action)
+                # 将action转换为列表（如果是numpy数组）
+                action_list = action.tolist() if hasattr(action, 'tolist') else list(action)
                 # 行数据：步数、episode、11个action值（归一化）、11个解码后的配置值、吞吐量、奖励
                 # 注意：扩展状态向量后，可以添加更多指标到CSV
                 row = (
                     [self.current_step, self.current_episode] +
                     action_list +
                     decoded_values +
+                    sys_values +
                     [throughput, reward]
                 )
-                writer.writerow(row)
-                f.flush()  # 确保立即写入磁盘
-                import os
-                os.fsync(f.fileno())  # 强制同步到磁盘
+                with open(self.csv_path, 'a', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(row)
+                    f.flush()  # 确保立即写入磁盘
+                    import os
+                    os.fsync(f.fileno())  # 强制同步到磁盘
                 if self.current_step <= 3 or self.current_step % 20 == 0:
-                    print(f"[ActionThroughputLogger] CSV写入完成")
+                    print(f"[ActionThroughputLogger] CSV写入完成（步数: {self.current_step}, episode: {self.current_episode}）")
             except PermissionError as e:
                 # 如果权限不足，打印详细错误信息
                 import os
@@ -859,6 +891,70 @@ class ProgressBarCallback(BaseCallback):
             print(f"\n训练完成！总步数: {self.num_timesteps:,}")
 
 
+def record_default_baseline(env, save_dir: Path) -> None:
+    """
+    在训练开始前记录默认配置下的基线性能。
+    记录的是归一化后的状态向量与吞吐量估计。
+    """
+    print("\n" + "=" * 80)
+    print("记录默认配置基线性能（默认参数 + 当前工作负载）...")
+    print("=" * 80)
+    try:
+        result = env.reset()
+        if isinstance(result, tuple) and len(result) == 2:
+            obs, info = result
+        else:
+            obs, info = result, {}
+
+        obs_list = [float(x) for x in obs]
+        throughput_norm = float(obs_list[1]) if len(obs_list) > 1 else 0.0
+        sys_metrics = {}
+        try:
+            metrics_env = env
+            max_unwrap_depth = 10
+            unwrap_count = 0
+            last_env = None
+            while unwrap_count < max_unwrap_depth:
+                if metrics_env is last_env:
+                    break
+                last_env = metrics_env
+                if hasattr(metrics_env, "get_last_broker_metrics"):
+                    break
+                if hasattr(metrics_env, "unwrapped"):
+                    metrics_env = metrics_env.unwrapped
+                    unwrap_count += 1
+                elif hasattr(metrics_env, "env"):
+                    metrics_env = metrics_env.env
+                    unwrap_count += 1
+                else:
+                    break
+            if hasattr(metrics_env, "get_last_broker_metrics"):
+                sys_metrics = metrics_env.get_last_broker_metrics()
+            elif hasattr(metrics_env, "_last_broker_metrics"):
+                sys_metrics = metrics_env._last_broker_metrics
+        except Exception:
+            sys_metrics = {}
+
+        baseline = {
+            "timestamp": time.time(),
+            "throughput_norm": throughput_norm,
+            "estimated_msg_rate": throughput_norm * 10000.0,
+            "state": obs_list,
+            "sys_metrics": sys_metrics,
+            "note": "state values are normalized; estimated_msg_rate uses 10000.0 scale",
+        }
+
+        baseline_path = save_dir / "baseline_metrics.json"
+        baseline_path.write_text(
+            json.dumps(baseline, indent=2, ensure_ascii=True),
+            encoding="utf-8",
+        )
+        print(f"[基线] ✅ 已记录: {baseline_path}")
+        print(f"[基线] 吞吐量(归一化): {throughput_norm:.6f}")
+    except Exception as e:
+        print(f"[基线] ❌ 记录失败: {e}")
+
+
 def main() -> None:
     args = parse_args()
 
@@ -1021,6 +1117,9 @@ def main() -> None:
         print("=" * 80)
         sys.exit(1)
 
+    # 记录默认配置下的基线性能（训练前）
+    record_default_baseline(env, Path(args.save_dir))
+
     model = make_ddpg_model(
         env=env,
         tau=args.tau,
@@ -1162,4 +1261,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

@@ -8,7 +8,7 @@
 docs/
 ├── training/          # 训练相关文档
 ├── troubleshooting/  # 问题修复和故障排除文档
-├── analysis/          # 分析报告
+├── plans/             # 设计与计划
 ├── technical/         # 技术说明文档
 └── guides/           # 通用指南（预留）
 ```
@@ -25,6 +25,8 @@ docs/
 - **TRAINING_STABILITY_GUARANTEES.md** - 训练稳定性保证机制说明
 - **TRAINING_FLOW_CHECK.md** - 训练流程检查文档
 - **CODE_FLOW_VERIFICATION.md** - 代码流程验证报告（对照文档检查代码实现）
+- **MOSQUITTO_LOG_CONTROL.md** - Mosquitto日志控制与采集
+- **DISK_SPACE_OPTIMIZATION.md** - 训练磁盘空间优化建议
 
 ### 🔧 troubleshooting/ - 问题修复文档
 
@@ -40,19 +42,17 @@ docs/
 - **BROKER_CONNECTION_TROUBLESHOOTING.md** - Broker连接故障排除
 - **BROKER_FIX_SUMMARY.md** - Broker修复总结
 
-### 📊 analysis/ - 分析报告
-
-包含各种分析报告：
-
-- **RL_TRAINING_ISSUES_ANALYSIS.md** - 强化学习训练问题分析报告
-- **TRAINING_ANALYSIS.md** - 训练分析报告
-- **ACTION_THROUGHPUT_LOG.md** - Action和吞吐量日志分析
-
 ### 🔬 technical/ - 技术说明文档
 
 包含技术实现细节说明：
 
 - **ACTION_ADJUSTMENT_MODE.md** - Action调整模式说明（绝对调整 vs 增量调整）
+
+### 🧭 plans/ - 设计与计划
+
+包含方案设计与计划文档（可能会随实现推进而更新）：
+
+- `2026-02-03-brokertuner-rl-alignment-design.md` - RL对齐/设计方案草稿
 
 ## 快速导航
 
@@ -63,12 +63,11 @@ docs/
 
 ### 遇到问题
 1. 查看 **troubleshooting/** 目录下的相关修复文档
-2. 参考 **analysis/** 目录下的分析报告了解问题原因
 
 ### 深入了解
 1. 阅读 **training/CODE_FLOW_VERIFICATION.md** 了解代码实现
 2. 查看 **technical/** 目录了解技术细节
-3. 参考 **analysis/** 目录了解性能分析
+3. 参考 **training/** 目录了解训练流程与结果
 
 ## 文档维护
 

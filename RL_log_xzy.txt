@@ -1,0 +1,35 @@
+?? replay buffer在RL中是如何使用的？
+
+
+2026-1-20:
+问题： 
+(1)吞吐量并没有随 episode 单调提升：episode 均值约为 ep2=1.91、ep3=2.18、ep4=1.54、ep5=1.82、ep6=1.55（吞吐量是归一化 msg/s）。如果目标是“比默认配置更快”，仅凭 reward 很难判断
+(2)sys_msgs_received_rate 基本为空（846/852 行），说明采样窗口内很少拿到足够样本去计算 $SYS/broker/messages/received_rate（utils.py (line 124)），导致状态/奖励大概率主要依赖 $SYS/broker/load/messages/received/1min_per_sec（utils.py (line 273)）。这类 1min 指标更滞后，且在 broker 刚重启时可能不稳定。
+
+解决：
+（1）提高 $SYS 发布频率，减少 sys_msgs_received_rate / sys_clients_connected 空值：把 sys_interval 改为 1 秒（broker_template.conf (line 46)，以及 knobs.py (line 445) 的兜底模板）。
+（2）采样侧：MQTTSampler 增加等待派生 rate（sample_wait_for_derived_rate 等开关在 config.py (line 30)），减少“采样窗口不够导致算不出 rate”的情况。
+（3）reset/基线：每个 episode 重启后强制重建 sampler、（若有 workload_manager）重启 workload，并对 baseline 做多次采样直到满足最小吞吐/最小连接数阈值（避免 baseline≈0 导致 delta_base≈+1、reward 饱和的假象）。相关逻辑在 broker.py 的 reset() 和 _compute_reward()
+
+绘图数据收集：
+计划绘图：
+图 5.8 训练收敛曲线：✅可画（action_throughput_log.csv 的 step→reward；或 monitor.csv 的 episode→return）。⚠️目前只有单次运行/单 seed，做不了“多随机种子置信区间”。
+图 5.9 吞吐量随时间变化（动态接入）：❌数据不够。缺：①默认/人工/DDPG 三条线各自的同口径时间序列；②每点的wall-clock 时间戳；③上线/下线事件时间点（以及更完整的 clients_connected）。
+图 5.10 延迟分布图：❌数据不够。当前代码里的 latency 仍是占位/派生状态，日志里没有每条消息延迟样本或 p50/p95/p99（也没有对三方法的对比数据）。
+图 5.11 资源占用时间序列：❌数据不够。action_throughput_log.csv 里没有 CPU/MEM/带宽；baseline 也不是时间序列。
+图 5.12 参数轨迹图：✅可画（action_* 与 decoded_* 都在 action_throughput_log.csv）。
+图 5.13 综合对比柱状图：❌数据不够。需要每种方法的汇总指标：吞吐提升%、p95 延迟降低%、CPU 增幅%；目前缺延迟分位数与 CPU/MEM 时间序列/统计口径，且缺“默认/人工”对应数据。
+
+补齐数据：
+准备补齐数据，最小增量通常是：在 action_throughput_log.csv 里补 timestamp、CPU/MEM、clients_connected；另外单独做 3 个方法在“动态接入场景”的 eval_dynamic.csv（含时间戳+吞吐+clients+事件标注）和 eval_latency.csv（原始延迟样本或分位数）。
+按这些图的需求把日志字段/落盘格式补齐到代码里吗？
+
+
+
+
+
+
+
+
+
+

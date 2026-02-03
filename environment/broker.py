@@ -1,7 +1,7 @@
 import os
 import time
 import subprocess
-from typing import Any, Dict, Tuple, Optional
+from typing import Any, Dict, Tuple, Optional, List
 
 try:
     import gymnasium as gym
@@ -69,9 +69,13 @@ class MosquittoBrokerEnv(gym.Env):
         # 工作负载管理器（可选）
         self._workload_manager = workload_manager
 
+        self._last_broker_metrics: Dict[str, float] = {}
+        self._last_broker_metrics_ts: float = 0.0
+
         self._step_count = 0
         self._last_state: Optional[np.ndarray] = None
         self._initial_state: Optional[np.ndarray] = None  # D_0: 初始状态性能
+        self._last_applied_knobs: Optional[Dict[str, Any]] = None
         self._need_workload_restart = False  # 标志：是否需要重启工作负载
 
         # 历史状态跟踪（用于滑动窗口平均）
@@ -117,36 +121,121 @@ class MosquittoBrokerEnv(gym.Env):
         if seed is not None:
             np.random.seed(seed)
         
-        # 在reset时，应用默认配置，确保初始状态基于默认参数
-        # 这样第一步的action就是默认配置
+        # 在reset时应用默认配置，确保初始状态基于默认参数
+        used_restart = False
         default_knobs = self.knob_space.get_default_knobs()
-        if self._step_count == 0:  # 只在第一次reset时应用默认配置
-            print("[MosquittoBrokerEnv] 应用默认Broker配置...")
-            used_restart = apply_knobs(default_knobs)
-            if used_restart:
-                print("[MosquittoBrokerEnv] Broker已重启，等待稳定...")
-                self._wait_for_broker_ready(max_wait_sec=self.cfg.broker_restart_stable_sec)
-                # 等待$SYS主题发布
-                print("[MosquittoBrokerEnv] 等待$SYS主题发布...")
-                time.sleep(12.0)
-            else:
-                # 等待Broker稳定（如果只是reload）
-                time.sleep(3.0)
+        if self.cfg.apply_default_on_reset:
+            if self._last_applied_knobs != default_knobs:
+                print("[MosquittoBrokerEnv] 应用默认Broker配置...")
+                apply_knobs(default_knobs)
+                used_restart = True  # 只要knob变化就视为重启
+                self._last_applied_knobs = default_knobs.copy()
+                if used_restart:
+                    print("[MosquittoBrokerEnv] Broker已重启，等待稳定...")
+                    self._wait_for_broker_ready(max_wait_sec=self.cfg.broker_restart_stable_sec)
+                    # Broker 重启后，MQTT 采样器连接可能断开；这里强制重建，避免采样到旧连接的缓存
+                    if self._mqtt_sampler is not None:
+                        try:
+                            self._mqtt_sampler.close()
+                        except Exception:
+                            pass
+                        self._mqtt_sampler = None
+
+                    # Broker 重启会断开所有客户端连接：确保工作负载恢复后再采样 baseline
+                    if self._workload_manager is not None:
+                        try:
+                            if self._workload_manager.is_running():
+                                self._workload_manager.stop()
+                                time.sleep(1.0)
+                            if getattr(self._workload_manager, "_last_config", None) is not None:
+                                self._workload_manager.restart()
+                                # 给工作负载一点时间建立连接并开始产生活动
+                                time.sleep(max(2.0, float(self.cfg.baseline_retry_sleep_sec)))
+                            else:
+                                print("[MosquittoBrokerEnv] ⚠️  工作负载管理器无_last_config，无法在reset中自动重启工作负载")
+                        except Exception as e:
+                            print(f"[MosquittoBrokerEnv] ⚠️  reset中重启工作负载失败: {e}")
         
         self._step_count = 0
+        self._need_workload_restart = False
+        self._throughput_history = []
+        self._latency_history = []
+        
+        # 在采样初始状态前，确保工作负载正在运行并稳定（仅在第一次reset时）
+        if self._initial_state is None and self._workload_manager is not None:
+            print("[MosquittoBrokerEnv] 准备采样初始状态，确保工作负载正在运行...")
+            if not self._workload_manager.is_running():
+                print("[MosquittoBrokerEnv] 工作负载未运行，启动工作负载...")
+                try:
+                    if self._workload_manager._last_config is not None:
+                        self._workload_manager.restart()
+                        print("[MosquittoBrokerEnv] 工作负载已启动，等待稳定运行（30秒）...")
+                        time.sleep(30.0)
+                        # 验证工作负载是否正常运行
+                        if self._workload_manager.is_running():
+                            print("[MosquittoBrokerEnv] ✅ 工作负载已稳定运行")
+                        else:
+                            print("[MosquittoBrokerEnv] ⚠️  警告：工作负载启动后未运行")
+                    else:
+                        print("[MosquittoBrokerEnv] ⚠️  警告：工作负载管理器没有保存的配置，无法启动")
+                except Exception as e:
+                    print(f"[MosquittoBrokerEnv] ⚠️  启动工作负载失败: {e}")
+            else:
+                print("[MosquittoBrokerEnv] ✅ 工作负载正在运行")
+            
+            # 等待$SYS主题发布（确保包含工作负载产生的消息）
+            print("[MosquittoBrokerEnv] 等待$SYS主题发布（确保包含工作负载产生的消息，12秒）...")
+            time.sleep(12.0)
+        
         print("[MosquittoBrokerEnv] 开始采样初始状态...")
-        state = self._sample_state()
+        state = None
+        baseline_ok = False
+        last_candidate: Optional[np.ndarray] = None
+        for attempt in range(max(1, int(self.cfg.baseline_max_attempts))):
+            candidate = self._sample_state()
+
+            # 验证状态有效性
+            if np.any(np.isnan(candidate)) or np.any(np.isinf(candidate)):
+                print("[MosquittoBrokerEnv] 警告: reset时检测到无效状态值（NaN/Inf），使用零状态")
+                candidate = np.zeros(self.cfg.state_dim, dtype=np.float32)
+
+            # 限制状态值范围
+            candidate = np.clip(candidate, -1e6, 1e6)
+            last_candidate = candidate
+
+            clients_norm = float(candidate[0])
+            throughput_norm = float(candidate[1])
+            if (
+                clients_norm >= float(self.cfg.baseline_min_clients_norm)
+                and throughput_norm >= float(self.cfg.baseline_min_throughput)
+            ):
+                baseline_ok = True
+                state = candidate
+                break
+
+            if attempt < int(self.cfg.baseline_max_attempts) - 1:
+                print(
+                    "[MosquittoBrokerEnv] ⚠️  baseline采样过低，重试 "
+                    f"{attempt + 1}/{self.cfg.baseline_max_attempts}："
+                    f"clients_norm={clients_norm:.6f}, throughput_norm={throughput_norm:.6f}"
+                )
+                time.sleep(float(self.cfg.baseline_retry_sleep_sec))
+
+        if state is None:
+            state = last_candidate if last_candidate is not None else np.zeros(self.cfg.state_dim, dtype=np.float32)
         print("[MosquittoBrokerEnv] 初始状态采样完成")
         
-        # 验证状态有效性
-        if np.any(np.isnan(state)) or np.any(np.isinf(state)):
-            print(f"[MosquittoBrokerEnv] 警告: reset时检测到无效状态值（NaN/Inf），使用零状态")
-            state = np.zeros(self.cfg.state_dim, dtype=np.float32)
+        # 根据配置决定是否每个 episode 更新基线
+        if self.cfg.baseline_per_episode or self._initial_state is None:
+            if baseline_ok or self._initial_state is None:
+                self._initial_state = state.copy()
+            else:
+                print("[MosquittoBrokerEnv] ⚠️  baseline不达标，保留上一episode的初始基线以避免奖励失真")
+            if hasattr(self, "_initial_throughput_logged"):
+                delattr(self, "_initial_throughput_logged")
+            initial_throughput = self._extract_throughput(self._initial_state)
+            print(f"[MosquittoBrokerEnv] ✅ 已设置episode初始吞吐量: {initial_throughput:.6f}")
         
-        # 限制状态值范围
-        state = np.clip(state, -1e6, 1e6)
-        
-        self._initial_state = state.copy()  # 保存初始状态 D_0
         self._last_state = state
         
         # gymnasium兼容：返回 (observation, info) 元组
@@ -177,7 +266,14 @@ class MosquittoBrokerEnv(gym.Env):
 
         # 1. 解码并应用 knobs
         knobs = self.knob_space.decode_action(action)
-        used_restart = apply_knobs(knobs)
+        used_restart = False
+        if self._last_applied_knobs == knobs:
+            if self._step_count <= 3 or self._step_count % 10 == 0:
+                print("[MosquittoBrokerEnv] 配置未变化，跳过应用与重启")
+        else:
+            apply_knobs(knobs)
+            used_restart = True  # 只要knob变化就视为重启
+            self._last_applied_knobs = knobs.copy()
         
         # 记录Broker重启信息（用于工作负载健康检查）
         # 注意：Broker重启会导致所有MQTT连接断开，包括工作负载
@@ -284,10 +380,11 @@ class MosquittoBrokerEnv(gym.Env):
                     pass
                 self._mqtt_sampler = None  # 标记为需要重新创建
         else:
-            stable_wait_sec = self.cfg.broker_reload_stable_sec
-            if self._step_count <= 3 or self._step_count % 10 == 0:  # 只在开始几步或每10步打印一次
-                print(f"[MosquittoBrokerEnv] Broker 已重载配置，等待 {stable_wait_sec} 秒让系统稳定...")
-            time.sleep(stable_wait_sec)
+            stable_wait_sec = self.cfg.step_interval_sec
+            if stable_wait_sec > 0:
+                if self._step_count <= 3 or self._step_count % 10 == 0:
+                    print(f"[MosquittoBrokerEnv] 配置未重启，等待 {stable_wait_sec} 秒让系统稳定...")
+                time.sleep(stable_wait_sec)
 
         # 3. 采样新状态（在等待工作负载稳定运行30秒之后进行）
         # 此时工作负载应该已经稳定运行，可以采集准确的指标
@@ -420,6 +517,8 @@ class MosquittoBrokerEnv(gym.Env):
             print(f"[MosquittoBrokerEnv] 开始采样Broker指标（超时: {self.cfg.mqtt.timeout_sec}秒）...")
         
         broker_metrics = self._mqtt_sampler.sample(timeout_sec=self.cfg.mqtt.timeout_sec)
+        self._last_broker_metrics = broker_metrics.copy()
+        self._last_broker_metrics_ts = time.time()
         
         if self._step_count <= 3 or self._step_count % 20 == 0:
             print(f"[MosquittoBrokerEnv] 采样完成，收到 {len(broker_metrics)} 条指标")
@@ -437,7 +536,7 @@ class MosquittoBrokerEnv(gym.Env):
                 print("  1. Broker未配置sys_interval（不发布$SYS主题）")
                 print("  2. Broker刚重启，$SYS主题还未发布（需要等待sys_interval时间）")
                 print("  3. 采样时间太短（当前: {:.1f}秒）".format(self.cfg.mqtt.timeout_sec))
-                print("[MosquittoBrokerEnv] 建议: 检查Broker配置是否有 'sys_interval 10'")
+                print("[MosquittoBrokerEnv] 建议: 检查Broker配置是否有 'sys_interval 1'（或更小）")
         
         # 进程指标
         if self._step_count <= 3 or self._step_count % 20 == 0:
@@ -462,11 +561,12 @@ class MosquittoBrokerEnv(gym.Env):
             cpu_ratio,
             mem_ratio,
             ctxt_ratio,
-            latency_p50=latency_p50,
-            latency_p95=latency_p95,
             queue_depth=queue_depth,
             throughput_history=self._throughput_history,
+            latency_p50=latency_p50,
+            latency_p95=latency_p95,
             latency_history=self._latency_history,
+            rate_1min_window_sec=self.cfg.mqtt.rate_1min_window_sec,
         )
         if self._step_count <= 3 or self._step_count % 20 == 0:
             print(f"[MosquittoBrokerEnv] 状态向量构建完成: {state}")
@@ -479,85 +579,76 @@ class MosquittoBrokerEnv(gym.Env):
         next_state: np.ndarray,
     ) -> float:
         """
-        改进的奖励函数设计：
-        使用绝对性能奖励 + 相对改进奖励 + 稳定性惩罚的组合
-
-        奖励组成部分：
-        1. 绝对性能奖励：基于当前吞吐量和延迟的绝对表现
-        2. 相对改进奖励：相对于上一步的性能改进
-        3. 稳定性惩罚：惩罚频繁的配置变化
-        4. 资源约束惩罚：防止过度使用资源
-
-        公式：
-        reward = α * throughput_abs + β * (-latency_abs) +
-                 γ * throughput_improvement + δ * (-latency_improvement) +
-                 ε * stability_penalty + ζ * resource_penalty
+        基于吞吐量的奖励函数：
+        - 主要看相对初始基线的提升（主信号）
+        - 同时加入相对上一步的变化（平滑训练）
         """
-        # 1. 绝对性能奖励
-        throughput_abs = self._extract_throughput(next_state)  # 吞吐量（归一化）
-        latency_abs = self._extract_latency(next_state)       # 延迟（归一化）
+        eps = 1e-6
+        denom_floor = max(float(self.cfg.baseline_min_throughput), eps)
 
-        # 2. 相对改进奖励（如果有上一步状态）
-        throughput_improvement = 0.0
-        latency_improvement = 0.0
+        current_throughput = self._extract_throughput(next_state)
+        prev_throughput = self._extract_throughput(prev_state) if prev_state is not None else current_throughput
 
-        if prev_state is not None:
-            prev_throughput = self._extract_throughput(prev_state)
-            prev_latency = self._extract_latency(prev_state)
+        initial_throughput = current_throughput
+        if self._initial_state is not None:
+            initial_throughput = self._extract_throughput(self._initial_state)
+            if not hasattr(self, '_initial_throughput_logged'):
+                print(f"[Reward] 📌 episode初始吞吐量: {initial_throughput:.6f}")
+                self._initial_throughput_logged = True
 
-            throughput_improvement = throughput_abs - prev_throughput
-            latency_improvement = prev_latency - latency_abs  # 延迟降低是改进
+        if self._throughput_history:
+            avg_throughput = float(np.mean(self._throughput_history))
+        else:
+            avg_throughput = current_throughput
 
-        # 3. 稳定性惩罚（避免频繁配置变化）
-        stability_penalty = 0.0
-        if prev_state is not None and len(next_state) >= 11:  # 假设前11维是配置相关的状态
-            # 计算配置变化程度（这里简化，使用吞吐量和延迟的变化作为代理）
-            config_change = abs(throughput_improvement) + abs(latency_improvement)
-            stability_penalty = -2.0 * config_change  # 惩罚大的变化
+        if initial_throughput < denom_floor:
+            # 初始基线异常（常见于采样不完整或工作负载未就绪），避免 delta_base 长期饱和导致“奖励看起来很好”的假象
+            delta_base = 0.0
+        else:
+            delta_base = (avg_throughput - initial_throughput) / initial_throughput
 
-        # 4. 资源约束惩罚
-        cpu_ratio = float(next_state[2])
-        mem_ratio = float(next_state[3])
+        denom_step = max(prev_throughput, denom_floor)
+        delta_step = (current_throughput - prev_throughput) / denom_step
 
-        resource_penalty = 0.0
-        # CPU 约束：超过 90% 时惩罚
-        if cpu_ratio > 0.9:
-            resource_penalty -= 50.0 * (cpu_ratio - 0.9)
-        # 内存约束：超过 90% 时惩罚
-        if mem_ratio > 0.9:
-            resource_penalty -= 50.0 * (mem_ratio - 0.9)
+        if self.cfg.reward_use_tanh:
+            delta_base = np.tanh(delta_base)
+            delta_step = np.tanh(delta_step)
+        else:
+            delta_base = np.clip(delta_base, -self.cfg.reward_delta_clip, self.cfg.reward_delta_clip)
+            delta_step = np.clip(delta_step, -self.cfg.reward_delta_clip, self.cfg.reward_delta_clip)
 
-        # 5. 权重系数（调优后的值）
-        alpha = 100.0   # 绝对吞吐量权重
-        beta = 50.0     # 绝对延迟权重（负值）
-        gamma = 50.0    # 吞吐量改进权重
-        delta = 30.0    # 延迟改进权重
-        epsilon = 1.0   # 稳定性惩罚权重
-        zeta = 1.0      # 资源惩罚权重
-
-        # 6. 计算最终奖励
-        performance_reward = (
-            alpha * throughput_abs +                    # 绝对吞吐量奖励
-            beta * (-latency_abs) +                     # 绝对延迟惩罚（延迟越低越好）
-            gamma * throughput_improvement +            # 吞吐量改进奖励
-            delta * latency_improvement +               # 延迟改进奖励
-            epsilon * stability_penalty                 # 稳定性惩罚
+        reward = self.cfg.reward_scale * (
+            self.cfg.reward_weight_base * delta_base +
+            self.cfg.reward_weight_step * delta_step
         )
 
-        reward = performance_reward + zeta * resource_penalty
-
-        # 7. 确保奖励是有效数值
         reward = float(reward)
         if np.isnan(reward) or np.isinf(reward):
             reward = 0.0
 
+        reward = np.clip(reward, -self.cfg.reward_clip, self.cfg.reward_clip)
+
+        # 打印奖励信息（调试用）
         if self._step_count <= 3 or self._step_count % 20 == 0:
-            print(f"[Reward] 吞吐量: {throughput_abs:.6f}, 延迟: {latency_abs:.6f}, "
-                  f"改进: 吞吐量{throughput_improvement:+.6f}, 延迟{latency_improvement:+.6f}, "
-                  f"稳定性惩罚: {stability_penalty:.6f}, 资源惩罚: {resource_penalty:.6f}, "
+            prev_throughput_str = f"{prev_throughput:.6f}" if prev_state is not None else "N/A"
+            initial_throughput_str = f"{initial_throughput:.6f}" if self._initial_state is not None else "N/A"
+            reward_type = "正向" if reward > 0 else ("负向" if reward < 0 else "零")
+            print(f"[Reward] 当前吞吐量: {current_throughput:.6f}, "
+                  f"平均吞吐量: {avg_throughput:.6f}, "
+                  f"上一时刻吞吐量: {prev_throughput_str}, "
+                  f"初始吞吐量: {initial_throughput_str}, "
+                  f"Δ_base: {delta_base:+.6f}, "
+                  f"Δ_step: {delta_step:+.6f}, "
+                  f"奖励类型: {reward_type}, "
                   f"总奖励: {reward:.6f}")
 
         return reward
+
+    def get_last_broker_metrics(self) -> Dict[str, float]:
+        """
+        返回最近一次采样的 broker 指标。
+        """
+        return dict(self._last_broker_metrics)
     
     def _extract_throughput(self, state: np.ndarray) -> float:
         """
@@ -705,4 +796,3 @@ class MosquittoBrokerEnv(gym.Env):
         if elapsed >= max_wait_sec:
             port_status = "端口已监听" if _check_port_listening(1883) else "端口未监听"
             print(f"[MosquittoBrokerEnv] 警告: Broker 在 {max_wait_sec} 秒内可能未完全就绪（{port_status}），继续执行...")
-

@@ -52,6 +52,16 @@ class BrokerKnobSpace:
     # max_packet_size: 当不为0时，最小值应为 20
     max_packet_size_range: Tuple[int, int] = (0, 10 * 1024 * 1024)
     message_size_limit_range: Tuple[int, int] = (0, 10 * 1024 * 1024)
+
+    # 各配置项的量化步长（减少噪声与过大搜索空间带来的抖动）
+    max_inflight_messages_step: int = 10
+    max_inflight_bytes_step: int = 256 * 1024
+    max_queued_messages_step: int = 100
+    max_queued_bytes_step: int = 1024 * 1024
+    memory_limit_step: int = 64 * 1024 * 1024
+    autosave_interval_step: int = 60
+    max_packet_size_step: int = 1024
+    message_size_limit_step: int = 1024
     
     # 默认值定义（用于环境初始化或作为参考）
     # 这些值对应 Mosquitto 的默认配置
@@ -129,18 +139,48 @@ class BrokerKnobSpace:
         def _interp(v: float, low: int, high: int) -> int:
             return int(low + v * (high - low))
 
+        def _quantize(value: int, step: int, low: int, high: int) -> int:
+            if value == 0:
+                return 0
+            if step <= 1:
+                return int(min(max(value, low), high))
+            quantized = int(round(value / step) * step)
+            if quantized == 0:
+                quantized = step
+            return int(min(max(quantized, low if low > 0 else step), high))
+
         # QoS 相关
         max_inflight_messages = _interp_with_zero(
             a[0], *self.max_inflight_messages_range
         )
+        max_inflight_messages = _quantize(
+            max_inflight_messages,
+            self.max_inflight_messages_step,
+            *self.max_inflight_messages_range
+        )
         max_inflight_bytes = _interp_with_zero(
             a[1], *self.max_inflight_bytes_range
+        )
+        max_inflight_bytes = _quantize(
+            max_inflight_bytes,
+            self.max_inflight_bytes_step,
+            *self.max_inflight_bytes_range
         )
         max_queued_messages = _interp_with_zero(
             a[2], *self.max_queued_messages_range
         )
+        max_queued_messages = _quantize(
+            max_queued_messages,
+            self.max_queued_messages_step,
+            *self.max_queued_messages_range
+        )
         max_queued_bytes = _interp_with_zero(
             a[3], *self.max_queued_bytes_range
+        )
+        max_queued_bytes = _quantize(
+            max_queued_bytes,
+            self.max_queued_bytes_step,
+            *self.max_queued_bytes_range
         )
         queue_qos0_messages = bool(a[4] >= 0.5)
 
@@ -148,9 +188,19 @@ class BrokerKnobSpace:
         memory_limit = _interp_with_zero(
             a[5], *self.memory_limit_range
         )
+        memory_limit = _quantize(
+            memory_limit,
+            self.memory_limit_step,
+            *self.memory_limit_range
+        )
         persistence = bool(a[6] >= 0.5)
         autosave_interval = _interp_with_zero(
             a[7], *self.autosave_interval_range
+        )
+        autosave_interval = _quantize(
+            autosave_interval,
+            self.autosave_interval_step,
+            *self.autosave_interval_range
         )
 
         # 网络 / 协议层
@@ -159,12 +209,22 @@ class BrokerKnobSpace:
         max_packet_size_raw = _interp_with_zero(
             a[9], *self.max_packet_size_range
         )
+        max_packet_size_raw = _quantize(
+            max_packet_size_raw,
+            self.max_packet_size_step,
+            *self.max_packet_size_range
+        )
         if max_packet_size_raw > 0 and max_packet_size_raw < 20:
             max_packet_size = 20
         else:
             max_packet_size = max_packet_size_raw
         message_size_limit = _interp_with_zero(
             a[10], *self.message_size_limit_range
+        )
+        message_size_limit = _quantize(
+            message_size_limit,
+            self.message_size_limit_step,
+            *self.message_size_limit_range
         )
 
         return {
@@ -382,7 +442,7 @@ def apply_knobs(knobs: Dict[str, Any], dry_run: bool = None, force_restart: bool
             "log_type none",
             "",
             "# $SYS 主题配置",
-            "sys_interval 10",
+            "sys_interval 1",
         ]
 
     def add_line(key: str, value: Any) -> None:
@@ -619,5 +679,3 @@ def apply_knobs(knobs: Dict[str, Any], dry_run: bool = None, force_restart: bool
             f"配置文件: {config_path}\n"
             f"提示: 可以手动检查配置文件: cat {config_path}"
         ) from exc
-
-

@@ -41,7 +41,7 @@ def make_ddpg_model(
     device: str = "cpu",
 ) -> DDPG:
     """
-    使用默认策略网络创建一个 DDPG 模型。
+    使用默认 MlpPolicy 创建一个 DDPG 模型。
     
     Args:
         env: 环境实例
@@ -114,4 +114,3 @@ def load_model(load_path: Union[str, Path], env: MosquittoBrokerEnv, device: str
         env=env,
         device=device,
     )
-

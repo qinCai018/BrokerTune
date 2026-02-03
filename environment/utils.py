@@ -1,5 +1,6 @@
 import json
 import time
+import threading
 from typing import Dict, Optional, Tuple, List
 
 import numpy as np
@@ -42,7 +43,13 @@ class MQTTSampler:
         self._cfg = cfg
         self._client = mqtt.Client(client_id=cfg.client_id, clean_session=True)
         self._metrics: Dict[str, float] = {}
+        self._metrics_ts: Dict[str, float] = {}
+        self._rx_seq = 0
+        self._lock = threading.Lock()
         self._connected = False  # 连接状态标志
+        self._topic_prev: Dict[str, Tuple[float, float]] = {}
+        self._topic_last: Dict[str, Tuple[float, float]] = {}
+        self._topic_count: Dict[str, int] = {}
 
         self._client.on_connect = self._on_connect
         self._client.on_message = self._on_message
@@ -85,10 +92,52 @@ class MQTTSampler:
         payload = msg.payload.decode("utf-8", errors="ignore").strip()
         value = _parse_numeric_payload(payload)
         if value is not None:
-            self._metrics[topic] = value
-            # 调试：打印收到的消息（仅在开始时）
-            if len(self._metrics) <= 3:  # 只打印前3条消息
+            now = time.time()
+            with self._lock:
+                self._rx_seq += 1
+                self._metrics[topic] = value
+                self._metrics_ts[topic] = now
+
+                last = self._topic_last.get(topic)
+                if last is not None:
+                    last_value, last_time = last
+                    if topic == "$SYS/broker/uptime" and value + 1e-6 < last_value:
+                        # broker 重启导致 uptime 回退；清理历史，避免跨重启计算速率
+                        self._topic_prev.pop(topic, None)
+                        self._topic_last[topic] = (value, now)
+                        self._topic_count[topic] = 1
+                    else:
+                        self._topic_prev[topic] = last
+                        self._topic_last[topic] = (value, now)
+                        self._topic_count[topic] = self._topic_count.get(topic, 0) + 1
+                else:
+                    self._topic_last[topic] = (value, now)
+                    self._topic_count[topic] = 1
+
+            if self._topic_count.get(topic, 0) <= 1:
                 print(f"[MQTTSampler] 收到消息: {topic} = {value}")
+
+    def _compute_rate_from_history(
+        self, topic: str, min_interval_sec: float, min_samples: int
+    ) -> Optional[float]:
+        with self._lock:
+            prev = self._topic_prev.get(topic)
+            last = self._topic_last.get(topic)
+            count = self._topic_count.get(topic, 0)
+        if prev is None or last is None:
+            return None
+        if count < max(2, min_samples):
+            return None
+        prev_value, prev_time = prev
+        last_value, last_time = last
+        if last_time <= prev_time:
+            return None
+        if last_time - prev_time < min_interval_sec:
+            return None
+        delta = last_value - prev_value
+        if delta < 0:
+            return None
+        return delta / (last_time - prev_time)
 
     # ---------- 公共接口 ----------
     def sample(self, timeout_sec: Optional[float] = None) -> Dict[str, float]:
@@ -96,27 +145,51 @@ class MQTTSampler:
         在给定窗口内收集一轮 broker 指标。
         返回：{topic: value}，仅保留数值型 payload。
         """
-        self._metrics.clear()
         wait = timeout_sec if timeout_sec is not None else self._cfg.timeout_sec
-        
-        # 使用循环等待，每1秒检查一次是否收到消息，并打印进度
-        import time
         start_time = time.time()
-        check_interval = 1.0  # 每1秒检查一次
-        last_count = 0
-        
+        required_topics = list(getattr(self._cfg, "sample_wait_for_topics", []))
+
+        def _is_required_topics_fresh() -> bool:
+            if not required_topics:
+                return True
+            with self._lock:
+                for topic in required_topics:
+                    ts = self._metrics_ts.get(topic)
+                    if ts is None or ts < start_time:
+                        return False
+            return True
+
         while time.time() - start_time < wait:
-            remaining = wait - (time.time() - start_time)
-            sleep_time = min(check_interval, remaining)
-            time.sleep(sleep_time)
-            
-            # 每1秒打印一次进度（如果收到新消息）
-            current_count = len(self._metrics)
-            if current_count != last_count:
-                print(f"[MQTTSampler] 采样中... 已收到 {current_count} 条指标（剩余 {remaining:.1f}秒）")
-                last_count = current_count
-        
-        metrics = dict(self._metrics)
+            ready = _is_required_topics_fresh()
+            if ready and getattr(self._cfg, "sample_wait_for_derived_rate", True):
+                derived = self._compute_rate_from_history(
+                    "$SYS/broker/messages/received",
+                    min_interval_sec=self._cfg.rate_min_interval_sec,
+                    min_samples=self._cfg.rate_min_samples,
+                )
+                if derived is not None and derived > 0:
+                    break
+            if ready and not getattr(self._cfg, "sample_wait_for_derived_rate", True):
+                break
+            time.sleep(max(0.01, getattr(self._cfg, "sample_poll_interval_sec", 0.1)))
+
+        with self._lock:
+            metrics = dict(self._metrics)
+
+        derived_rate = self._compute_rate_from_history(
+            "$SYS/broker/messages/received",
+            min_interval_sec=self._cfg.rate_min_interval_sec,
+            min_samples=self._cfg.rate_min_samples,
+        )
+        if derived_rate is not None:
+            metrics["$SYS/broker/messages/received_rate"] = derived_rate
+        rate_1min_raw = metrics.get("$SYS/broker/load/messages/received/1min")
+        if rate_1min_raw is not None and rate_1min_raw > 0:
+            divisor = self._cfg.rate_1min_divisor
+            if divisor and divisor > 0:
+                metrics["$SYS/broker/load/messages/received/1min_per_sec"] = (
+                    rate_1min_raw / divisor
+                )
         print(f"[MQTTSampler] 采样完成，共收到 {len(metrics)} 条指标")
         return metrics
 
@@ -133,13 +206,25 @@ def _parse_numeric_payload(payload: str) -> Optional[float]:
     try:
         return float(payload)
     except ValueError:
-        # 尝试解析 JSON 里名为 value 的字段
-        try:
-            obj = json.loads(payload)
-            if isinstance(obj, dict) and "value" in obj:
-                return float(obj["value"])
-        except Exception:
-            return None
+        pass
+
+    # 处理 "123 seconds" 或 "123s" 这类 uptime 格式
+    lowered = payload.lower()
+    if "second" in lowered or lowered.endswith("s"):
+        tokens = lowered.replace("seconds", "").replace("second", "").strip().split()
+        if tokens:
+            try:
+                return float(tokens[0])
+            except ValueError:
+                pass
+
+    # 尝试解析 JSON 里名为 value 的字段
+    try:
+        obj = json.loads(payload)
+        if isinstance(obj, dict) and "value" in obj:
+            return float(obj["value"])
+    except Exception:
+        return None
     return None
 
 
@@ -214,52 +299,80 @@ def build_state_vector(
     ctxt_ratio: float,
     queue_depth: float = 0.0,
     throughput_history: Optional[List[float]] = None,
+    latency_p50: float = 0.0,
+    latency_p95: float = 0.0,
+    latency_history: Optional[List[float]] = None,
+    rate_1min_window_sec: float = 60.0,
 ) -> np.ndarray:
     """
     将 Mosquitto 运行指标 + 进程指标拼成状态向量 s_t。
 
-    这里给出一个扩展实现：
-    - 连接数：从 "$SYS/broker/clients/connected" 获取，若不存在则为 0
-    - 消息速率：从 "$SYS/broker/messages/received"、"$SYS/broker/messages/sent"
-      等主题中择一（这里简单取 received）
-    - 队列深度：Broker内部队列状态
-    - 历史信息：滑动窗口平均值（用于稳定性评估）
+    返回10维状态向量：
+    - [0] broker 当前连接数（归一化）
+    - [1] broker 消息速率（msg/s，归一化）
+    - [2] CPU 使用占比
+    - [3] RSS 内存占比
+    - [4] 每秒上下文切换数占比
+    - [5] P50 端到端延迟（ms，归一化）
+    - [6] P95 端到端延迟（ms，归一化）
+    - [7] 队列深度（归一化）
+    - [8] 最近5步平均吞吐量（滑动窗口）
+    - [9] 最近5步平均延迟（滑动窗口）
     """
     # 这些 key 可根据你的 broker 实际暴露的 $SYS 主题进行调整
     clients_connected = broker_metrics.get(
         "$SYS/broker/clients/connected", 0.0
     )
     
-    # 优先使用速率指标（1分钟内的消息速率），如果没有则使用累计值
-    # $SYS/broker/load/messages/received/1min 是速率（msg/s）
-    # $SYS/broker/messages/received 是累计值（Broker重启后重置）
-    messages_rate_1min = broker_metrics.get(
-        "$SYS/broker/load/messages/received/1min", 0.0
+    # 优先使用采样窗口估算的速率，其次使用 1min 平均速率（换算为 msg/s）
+    # 采样窗口速率与当前 action 更同步；1min 更平滑但滞后
+    messages_rate_derived = broker_metrics.get(
+        "$SYS/broker/messages/received_rate"
     )
-    messages_received_total = broker_metrics.get(
-        "$SYS/broker/messages/received", 0.0
+    messages_rate_1min_per_sec = broker_metrics.get(
+        "$SYS/broker/load/messages/received/1min_per_sec"
     )
-    
-    # 如果速率指标可用，使用速率；否则使用累计值（不推荐，但作为后备）
-    if messages_rate_1min > 0:
-        messages_received = messages_rate_1min  # 已经是速率（msg/s）
+
+    uptime_sec = broker_metrics.get("$SYS/broker/uptime")
+    use_derived = (
+        messages_rate_derived is not None and messages_rate_derived > 0
+    )
+    use_1min = (
+        messages_rate_1min_per_sec is not None and messages_rate_1min_per_sec > 0
+    )
+    if uptime_sec is None:
+        # 未拿到 uptime 时，不使用 1min 指标，避免在 broker 刚重启/采样不完整时误用滞后指标
+        use_1min = False
+    elif uptime_sec < rate_1min_window_sec:
+        # Broker刚重启时1min指标不稳定，优先使用采样窗口估算
+        use_1min = False
+
+    if use_derived:
+        messages_received = messages_rate_derived
+    elif use_1min:
+        messages_received = messages_rate_1min_per_sec
     else:
-        # 累计值，需要除以时间得到速率（这里假设采样间隔为1秒，但实际可能不准确）
-        messages_received = messages_received_total  # 作为后备，但可能不准确
+        messages_received = 0.0
 
     # 简单归一化，避免数量级差距过大
     clients_norm = clients_connected / 1000.0  # 假设 1000 连接为 1.0
     # 如果使用速率指标，已经是msg/s，直接归一化；如果使用累计值，需要除以时间
     msg_rate_norm = messages_received / 10000.0  # 假设 1w msg/s 为 1.0
 
+    # 延迟归一化（假设 100ms 为 1.0）
+    latency_p50_norm = latency_p50 / 100.0  # P50延迟归一化
+    latency_p95_norm = latency_p95 / 100.0  # P95延迟归一化
+
     # 队列深度归一化（假设 1000 为 1.0）
     queue_depth_norm = queue_depth / 1000.0
 
     # 历史信息：滑动窗口平均值
     throughput_avg = np.mean(throughput_history) if throughput_history else msg_rate_norm
+    latency_avg = np.mean(latency_history) if latency_history else latency_p50_norm
 
-    # 归一化历史平均值
-    throughput_avg_norm = throughput_avg / 10000.0
+    # 归一化历史平均值（历史值本身已是归一化）
+    throughput_avg_norm = throughput_avg
+    latency_avg_norm = latency_avg
 
     state = np.array(
         [
@@ -268,8 +381,11 @@ def build_state_vector(
             cpu_ratio,             # [2] CPU使用率
             mem_ratio,             # [3] 内存使用率
             ctxt_ratio,            # [4] 上下文切换率
-            queue_depth_norm,      # [5] 队列深度归一化
-            throughput_avg_norm,   # [6] 最近5步吞吐量平均
+            latency_p50_norm,      # [5] P50延迟归一化
+            latency_p95_norm,      # [6] P95延迟归一化
+            queue_depth_norm,      # [7] 队列深度归一化
+            throughput_avg_norm,   # [8] 最近5步吞吐量平均
+            latency_avg_norm,      # [9] 最近5步平均延迟
         ],
         dtype=np.float32,
     )
@@ -278,4 +394,3 @@ def build_state_vector(
     state = np.nan_to_num(state, nan=0.0, posinf=1e6, neginf=-1e6)
     
     return state
-
