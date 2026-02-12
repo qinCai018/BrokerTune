@@ -441,6 +441,11 @@ class MosquittoBrokerEnv(gym.Env):
         info: Dict[str, Any] = {
             "knobs": knobs,
             "step": self._step_count,
+            "latency_source": "static",
+            "latency_probe_connected": False,
+            "latency_probe_samples": 0,
+            "latency_probe_min": 0.0,
+            "latency_probe_max": 0.0,
         }
 
         if self._step_count <= 3 or self._step_count % 20 == 0:

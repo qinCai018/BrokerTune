@@ -460,7 +460,15 @@ class ActionThroughputLoggerWrapper(gym.Env):
                     self.action_names +
                     self.knob_names +
                     self.sys_metric_names +
-                    ["throughput", "reward"]
+                    [
+                        "throughput",
+                        "reward",
+                        "latency_source",
+                        "latency_probe_connected",
+                        "latency_probe_samples",
+                        "latency_probe_min",
+                        "latency_probe_max",
+                    ]
                 )
                 # 注意：未来可以添加更多状态指标到CSV，如延迟等
                 writer.writerow(header)
@@ -668,6 +676,11 @@ class ActionThroughputLoggerWrapper(gym.Env):
             if self.current_step <= 3 or self.current_step % 20 == 0:
                 print(f"[ActionThroughputLogger] 开始写入CSV文件...")
             try:
+                latency_source = info.get("latency_source", "")
+                latency_probe_connected = info.get("latency_probe_connected", "")
+                latency_probe_samples = info.get("latency_probe_samples", "")
+                latency_probe_min = info.get("latency_probe_min", "")
+                latency_probe_max = info.get("latency_probe_max", "")
                 # 将action转换为列表（如果是numpy数组）
                 action_list = action.tolist() if hasattr(action, 'tolist') else list(action)
                 # 行数据：步数、episode、11个action值（归一化）、11个解码后的配置值、吞吐量、奖励
@@ -677,7 +690,15 @@ class ActionThroughputLoggerWrapper(gym.Env):
                     action_list +
                     decoded_values +
                     sys_values +
-                    [throughput, reward]
+                    [
+                        throughput,
+                        reward,
+                        latency_source,
+                        latency_probe_connected,
+                        latency_probe_samples,
+                        latency_probe_min,
+                        latency_probe_max,
+                    ]
                 )
                 with open(self.csv_path, 'a', newline='') as f:
                     writer = csv.writer(f)

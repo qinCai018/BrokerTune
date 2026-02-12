@@ -37,7 +37,7 @@ import time
 import os
 import signal
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 from dataclasses import dataclass
 
 
@@ -340,6 +340,20 @@ class WorkloadManager:
             "-c", str(config.num_connections),
         ]
         return cmd
+
+    def get_latency_probe_debug(self) -> Dict[str, Any]:
+        """主分支未实现延迟探测，返回空调试信息。"""
+        return {
+            "connected": False,
+            "samples": 0,
+            "min": 0.0,
+            "max": 0.0,
+            "p50": 0.0,
+            "p95": 0.0,
+            "topic": "",
+            "interval_sec": 0.0,
+            "window_size": 0,
+        }
     
     def stop(self) -> None:
         """停止所有工作负载进程"""
