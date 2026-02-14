@@ -113,3 +113,21 @@
 - Local environment lacks `stable_baselines3` import (ImportError), so SB3 source not inspectable here.
 - No dedicated test suite found (only `misc/verify/throughput_test.py` and docs mention pytest).
 - User selected approach: implement SB3 DDPG subclass to update PER priorities using TD-error while keeping SB3 training engine.
+
+## 2026-02-13
+- 训练/评估主入口确认：`tuner/train.py`、`tuner/evaluate.py`。
+- 环境主实现确认：`environment/broker.py`（`reset/step/_sample_state/_compute_reward`）。
+- 发现并修复关键偏差：
+  - 奖励函数仅用吞吐量，未显式优化时延；
+  - 时延数据是硬编码常量（10ms/50ms）；
+  - `info` 诊断字段不足，难以做性能归因；
+  - 评估脚本仅输出 reward，无 baseline 对比吞吐/时延；
+  - DDPG 超参（buffer、learning_starts、train_freq、noise、seed）缺少显式配置入口。
+- 新增延迟探测：`WorkloadManager` 中实现 MQTT 回环 probe，支持 `p50/p95/min/max/samples`。
+- 新增回归测试：
+  - `tests/test_env_reward.py`（奖励偏好低时延 + 失败转移截断）
+  - `tests/test_evaluate_metrics.py`（评估指标提取与汇总）
+- 本地验证结论：
+  - 语法检查通过；
+  - 4 个测试通过；
+  - 最小训练探测在当前沙箱环境受 MQTT 连接权限限制（`Operation not permitted`），属于运行环境限制而非代码语法错误。

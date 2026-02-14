@@ -13,14 +13,17 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import random
 import signal
 import sys
 import time
 from pathlib import Path
 
-from stable_baselines3.common.callbacks import CheckpointCallback, BaseCallback, EvalCallback
+from stable_baselines3.common.callbacks import CheckpointCallback, BaseCallback
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.logger import configure
+from stable_baselines3.common.utils import set_random_seed
+import numpy as np
 
 # 导入gym/gymnasium用于包装类继承
 try:
@@ -109,6 +112,55 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=128,
         help="训练批次大小，默认：128",
+    )
+    parser.add_argument(
+        "--replay-buffer-size",
+        type=int,
+        default=200000,
+        help="Replay Buffer容量，默认：200000",
+    )
+    parser.add_argument(
+        "--learning-starts",
+        type=int,
+        default=1000,
+        help="多少步后开始梯度更新，默认：1000",
+    )
+    parser.add_argument(
+        "--train-freq",
+        type=int,
+        default=1,
+        help="每多少环境步执行一次训练更新，默认：1",
+    )
+    parser.add_argument(
+        "--gradient-steps",
+        type=int,
+        default=1,
+        help="每次更新执行的梯度步数，默认：1",
+    )
+    parser.add_argument(
+        "--action-noise-type",
+        type=str,
+        default="ou",
+        choices=["ou", "normal", "none"],
+        help="探索噪声类型（ou/normal/none），默认：ou",
+    )
+    parser.add_argument(
+        "--action-noise-sigma",
+        type=float,
+        default=0.2,
+        help="探索噪声标准差，默认：0.2",
+    )
+    parser.add_argument(
+        "--action-noise-theta",
+        type=float,
+        default=0.15,
+        help="OU噪声theta参数，默认：0.15",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="随机种子，默认：42",
     )
     # 工作负载相关参数
     parser.add_argument(
@@ -462,7 +514,17 @@ class ActionThroughputLoggerWrapper(gym.Env):
                     self.sys_metric_names +
                     [
                         "throughput",
+                        "throughput_msg_per_sec",
+                        "latency_p50_ms",
+                        "latency_p95_ms",
+                        "queue_depth_norm",
                         "reward",
+                        "restart_count",
+                        "consecutive_failures",
+                        "reward_throughput_base",
+                        "reward_throughput_step",
+                        "reward_latency_base",
+                        "reward_latency_step",
                         "latency_source",
                         "latency_probe_connected",
                         "latency_probe_samples",
@@ -681,6 +743,17 @@ class ActionThroughputLoggerWrapper(gym.Env):
                 latency_probe_samples = info.get("latency_probe_samples", "")
                 latency_probe_min = info.get("latency_probe_min", "")
                 latency_probe_max = info.get("latency_probe_max", "")
+                throughput_msg_per_sec = info.get("throughput_msg_per_sec", throughput * 10000.0)
+                latency_p50_ms = info.get("latency_p50_ms", float(obs[5]) * 100.0 if len(obs) > 5 else 0.0)
+                latency_p95_ms = info.get("latency_p95_ms", float(obs[6]) * 100.0 if len(obs) > 6 else 0.0)
+                queue_depth_norm = info.get("queue_depth_norm", float(obs[7]) if len(obs) > 7 else 0.0)
+                restart_count = info.get("restart_count", "")
+                consecutive_failures = info.get("consecutive_failures", "")
+                reward_components = info.get("reward_components", {}) or {}
+                reward_tp_base = reward_components.get("throughput_base", "")
+                reward_tp_step = reward_components.get("throughput_step", "")
+                reward_lat_base = reward_components.get("latency_base", "")
+                reward_lat_step = reward_components.get("latency_step", "")
                 # 将action转换为列表（如果是numpy数组）
                 action_list = action.tolist() if hasattr(action, 'tolist') else list(action)
                 # 行数据：步数、episode、11个action值（归一化）、11个解码后的配置值、吞吐量、奖励
@@ -692,7 +765,17 @@ class ActionThroughputLoggerWrapper(gym.Env):
                     sys_values +
                     [
                         throughput,
+                        throughput_msg_per_sec,
+                        latency_p50_ms,
+                        latency_p95_ms,
+                        queue_depth_norm,
                         reward,
+                        restart_count,
+                        consecutive_failures,
+                        reward_tp_base,
+                        reward_tp_step,
+                        reward_lat_base,
+                        reward_lat_step,
                         latency_source,
                         latency_probe_connected,
                         latency_probe_samples,
@@ -978,6 +1061,17 @@ def record_default_baseline(env, save_dir: Path) -> None:
 
 def main() -> None:
     args = parse_args()
+    set_random_seed(args.seed)
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    try:
+        import torch
+
+        torch.manual_seed(args.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(args.seed)
+    except Exception:
+        pass
 
     env_cfg = EnvConfig()
     
@@ -1051,6 +1145,10 @@ def main() -> None:
     print("创建环境...")
     print("=" * 80)
     env = make_env(env_cfg, workload_manager=workload)
+    if hasattr(env.action_space, "seed"):
+        env.action_space.seed(args.seed)
+    if hasattr(env.observation_space, "seed"):
+        env.observation_space.seed(args.seed)
     
     # 保存原始环境的配置引用（Monitor包装后会无法直接访问）
     # 注意：env 可能是 Monitor 包装后的环境，需要通过 env.unwrapped 或 env.env 访问原始环境
@@ -1149,6 +1247,14 @@ def main() -> None:
         gamma=args.gamma,
         batch_size=args.batch_size,
         device=args.device,
+        replay_buffer_size=args.replay_buffer_size,
+        learning_starts=args.learning_starts,
+        train_freq=args.train_freq,
+        gradient_steps=args.gradient_steps,
+        action_noise_type=args.action_noise_type,
+        action_noise_sigma=args.action_noise_sigma,
+        action_noise_theta=args.action_noise_theta,
+        seed=args.seed,
     )
 
     save_dir = Path(args.save_dir)
@@ -1234,6 +1340,12 @@ def main() -> None:
     print(f"最多保留checkpoint数: {args.max_checkpoints}")
     print(f"保存replay buffer: {'是' if args.save_replay_buffer else '否（节省磁盘空间）'}")
     print(f"TensorBoard日志: {'启用' if tensorboard_available else '禁用'}")
+    print(f"随机种子: {args.seed}")
+    print(f"Replay Buffer容量: {args.replay_buffer_size}")
+    print(f"Learning starts: {args.learning_starts}")
+    print(f"Train freq: {args.train_freq} step")
+    print(f"Gradient steps: {args.gradient_steps}")
+    print(f"探索噪声: {args.action_noise_type} (sigma={args.action_noise_sigma}, theta={args.action_noise_theta})")
     if args.limit_action_log:
         print(f"Action日志记录间隔: 每{args.action_log_interval}步（节省磁盘空间）")
     print()

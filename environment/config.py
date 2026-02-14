@@ -136,6 +136,14 @@ class EnvConfig:
     reward_scale: float = 5.0
     reward_weight_base: float = 0.8
     reward_weight_step: float = 0.2
+    reward_weight_latency_base: float = 0.2
+    reward_weight_latency_step: float = 0.1
     reward_clip: float = 5.0
     reward_delta_clip: float = 2.0
     reward_use_tanh: bool = True
+    reward_latency_floor_norm: float = 0.01
+    failed_step_penalty: float = -3.0
+    max_consecutive_failures: int = 3
+    latency_fallback_p50_ms: float = 20.0
+    latency_fallback_p95_ms: float = 80.0
+    enable_latency_probe: bool = True

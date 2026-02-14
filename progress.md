@@ -116,3 +116,38 @@
   - Include timestamps for errors to track when issues occurred
 -->
 *Update after completing each phase or encountering errors*
+
+## Session: 2026-02-13
+
+### Phase 1-3
+- **Status:** complete
+- Actions taken:
+  - 审计 `environment/`、`tuner/`、`model/`、`script/` RL/DDPG 实现。
+  - 修复 reward（吞吐+时延）、`info` 指标、失败转移、延迟探测、评估对比逻辑。
+  - 扩展训练超参入口（replay/noise/seed 等）并接入模型构建。
+- Files created/modified:
+  - `environment/config.py`
+  - `environment/broker.py`
+  - `script/workload.py`
+  - `tuner/utils.py`
+  - `tuner/train.py`
+  - `tuner/evaluate.py`
+  - `tests/test_env_reward.py` (new)
+  - `tests/test_evaluate_metrics.py` (new)
+
+### Phase 4
+- **Status:** complete
+- Verification:
+  - `python3 - <<... compile(...) ...>>` ✅
+  - `PYTHONPATH=BrokerTuner pytest -q BrokerTuner/tests/test_env_reward.py BrokerTuner/tests/test_evaluate_metrics.py` ✅ (4 passed)
+  - `PYTHONPATH=BrokerTuner python3 -m tuner.train --help` ✅
+  - `PYTHONPATH=BrokerTuner python3 -m tuner.evaluate --help` ✅
+  - 最小训练探测命令：`PYTHONPATH=BrokerTuner BROKER_TUNER_DRY_RUN=true python3 -m tuner.train ... --total-timesteps 1`  
+    - 发现并修复：`replay_buffer_size` 参数名不兼容（改为 `buffer_size`）  
+    - 当前环境阻塞：MQTT 连接报 `Operation not permitted`
+
+### Error Log Additions
+| Timestamp | Error | Attempt | Resolution |
+|-----------|-------|---------|------------|
+| 2026-02-13 | TypeError: `DDPG.__init__() got an unexpected keyword argument 'replay_buffer_size'` | 1 | 参数改为 `buffer_size` |
+| 2026-02-13 | OSError: MQTT connect `Operation not permitted` (沙箱环境) | 1 | 记录为环境限制，代码侧补强失败诊断与回退 |

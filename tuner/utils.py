@@ -8,10 +8,13 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 from stable_baselines3 import DDPG
-from stable_baselines3.common.noise import OrnsteinUhlenbeckActionNoise
+from stable_baselines3.common.noise import (
+    NormalActionNoise,
+    OrnsteinUhlenbeckActionNoise,
+)
 import numpy as np
 
 from environment import EnvConfig, MosquittoBrokerEnv
@@ -39,6 +42,14 @@ def make_ddpg_model(
     actor_lr: Optional[float] = None,
     critic_lr: Optional[float] = None,
     device: str = "cpu",
+    replay_buffer_size: int = 1_000_000,
+    learning_starts: int = 1_000,
+    train_freq: int = 1,
+    gradient_steps: int = 1,
+    action_noise_type: str = "ou",
+    action_noise_sigma: float = 0.2,
+    action_noise_theta: float = 0.15,
+    seed: Optional[int] = None,
 ) -> DDPG:
     """
     使用默认 MlpPolicy 创建一个 DDPG 模型。
@@ -52,6 +63,14 @@ def make_ddpg_model(
         actor_lr: Actor学习率（可选）。如果同时指定了actor_lr和critic_lr，将使用两者的平均值
         critic_lr: Critic学习率（可选）。如果同时指定了actor_lr和critic_lr，将使用两者的平均值
         device: 训练设备
+        replay_buffer_size: Replay Buffer容量
+        learning_starts: 多少步后开始梯度更新
+        train_freq: 每多少步更新一次网络
+        gradient_steps: 每次更新执行多少次梯度步
+        action_noise_type: 探索噪声类型（ou/normal/none）
+        action_noise_sigma: 动作噪声标准差
+        action_noise_theta: OU噪声theta
+        seed: 随机种子
         
     Returns:
         DDPG模型实例
@@ -61,10 +80,25 @@ def make_ddpg_model(
         如果同时指定了 actor_lr 和 critic_lr，将使用两者的平均值作为统一的学习率。
     """
     n_actions = env.action_space.shape[0]
-    action_noise = OrnsteinUhlenbeckActionNoise(
-        mean=np.zeros(n_actions),
-        sigma=0.2 * np.ones(n_actions),
-    )
+    action_noise = None
+    noise_type = action_noise_type.lower().strip()
+    if noise_type == "ou":
+        action_noise = OrnsteinUhlenbeckActionNoise(
+            mean=np.zeros(n_actions),
+            sigma=float(action_noise_sigma) * np.ones(n_actions),
+            theta=float(action_noise_theta),
+        )
+    elif noise_type in {"normal", "gaussian"}:
+        action_noise = NormalActionNoise(
+            mean=np.zeros(n_actions),
+            sigma=float(action_noise_sigma) * np.ones(n_actions),
+        )
+    elif noise_type in {"none", "off"}:
+        action_noise = None
+    else:
+        raise ValueError(
+            f"不支持的action_noise_type: {action_noise_type}，可选值: ou / normal / none"
+        )
 
     # 如果指定了actor_lr或critic_lr，使用统一的学习率
     # 注意：stable_baselines3 的 DDPG 不支持分别设置 actor 和 critic 的学习率
@@ -96,8 +130,13 @@ def make_ddpg_model(
         batch_size=batch_size,
         gamma=gamma,
         tau=tau,
+        buffer_size=int(replay_buffer_size),
+        learning_starts=int(learning_starts),
+        train_freq=(int(train_freq), "step"),
+        gradient_steps=int(gradient_steps),
         verbose=1,
         device=device,
+        seed=seed,
     )
     return model
 

@@ -39,6 +39,8 @@ import signal
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 from dataclasses import dataclass
+from collections import deque
+import threading
 
 
 @dataclass
@@ -116,6 +118,15 @@ class WorkloadManager:
         self._processes: List[subprocess.Popen] = []
         self._is_running = False
         self._last_config: Optional[WorkloadConfig] = None  # 保存最后一次使用的配置，用于重启
+        self._latency_samples = deque(maxlen=256)
+        self._latency_lock = threading.Lock()
+        self._latency_probe_client = None
+        self._latency_probe_thread: Optional[threading.Thread] = None
+        self._latency_probe_stop_event = threading.Event()
+        self._latency_probe_connected = False
+        self._latency_probe_interval_sec = 1.0
+        self._latency_probe_window_size = 256
+        self._latency_probe_topic = "__broker_tuner/latency_probe"
     
     def _is_in_path(self, cmd: str) -> bool:
         """检查命令是否在系统 PATH 中"""
@@ -263,6 +274,7 @@ class WorkloadManager:
         print(f"[工作负载] 工作负载已启动，共 {len(self._processes)} 个进程")
         print(f"[工作负载] 主题: {config.topic}, QoS: {config.qos}")
         print(f"[工作负载] 发布者间隔: {config.publisher_interval_ms}ms")
+        self._start_latency_probe()
         
         # 验证工作负载是否真的在发送消息（等待5秒后验证）
         if config.num_publishers > 0:
@@ -341,18 +353,115 @@ class WorkloadManager:
         ]
         return cmd
 
+    def _start_latency_probe(self) -> None:
+        """
+        启动基于 MQTT 回环的延迟探测线程。
+        通过发布带时间戳的消息并在同一客户端订阅回环，估算端到端时延。
+        """
+        try:
+            import paho.mqtt.client as mqtt
+        except ImportError:
+            print("[工作负载] 警告: paho-mqtt 未安装，跳过延迟探测")
+            return
+
+        self._stop_latency_probe()
+        self._latency_probe_stop_event.clear()
+
+        client_id = f"broker_tuner_latency_probe_{os.getpid()}_{int(time.time())}"
+        client = mqtt.Client(client_id=client_id, clean_session=True)
+
+        def on_connect(client_obj, userdata, flags, rc):
+            self._latency_probe_connected = rc == 0
+            if rc == 0:
+                client_obj.subscribe(self._latency_probe_topic, qos=0)
+
+        def on_disconnect(client_obj, userdata, rc):
+            self._latency_probe_connected = False
+
+        def on_message(client_obj, userdata, msg):
+            try:
+                payload = msg.payload.decode("utf-8", errors="ignore").strip()
+                send_ts = float(payload)
+                latency_ms = max(0.0, (time.perf_counter() - send_ts) * 1000.0)
+                with self._latency_lock:
+                    self._latency_samples.append(latency_ms)
+            except Exception:
+                pass
+
+        client.on_connect = on_connect
+        client.on_disconnect = on_disconnect
+        client.on_message = on_message
+
+        try:
+            client.connect(self.broker_host, self.broker_port, 30)
+            client.loop_start()
+            self._latency_probe_client = client
+        except Exception as exc:
+            self._latency_probe_client = None
+            self._latency_probe_connected = False
+            print(f"[工作负载] 警告: 延迟探测连接失败: {exc}")
+            return
+
+        def _publish_loop():
+            while not self._latency_probe_stop_event.is_set():
+                if self._latency_probe_client is not None:
+                    payload = f"{time.perf_counter():.9f}"
+                    try:
+                        self._latency_probe_client.publish(
+                            self._latency_probe_topic, payload=payload, qos=0, retain=False
+                        )
+                    except Exception:
+                        self._latency_probe_connected = False
+                self._latency_probe_stop_event.wait(self._latency_probe_interval_sec)
+
+        self._latency_probe_thread = threading.Thread(target=_publish_loop, daemon=True)
+        self._latency_probe_thread.start()
+
+    def _stop_latency_probe(self) -> None:
+        self._latency_probe_stop_event.set()
+        if self._latency_probe_thread is not None:
+            self._latency_probe_thread.join(timeout=2.0)
+            self._latency_probe_thread = None
+        if self._latency_probe_client is not None:
+            try:
+                self._latency_probe_client.loop_stop()
+                self._latency_probe_client.disconnect()
+            except Exception:
+                pass
+            self._latency_probe_client = None
+        self._latency_probe_connected = False
+
     def get_latency_probe_debug(self) -> Dict[str, Any]:
-        """主分支未实现延迟探测，返回空调试信息。"""
+        """返回延迟探测状态与统计值。"""
+        with self._latency_lock:
+            samples = list(self._latency_samples)
+
+        if not samples:
+            return {
+                "connected": bool(self._latency_probe_connected),
+                "samples": 0,
+                "min": 0.0,
+                "max": 0.0,
+                "p50": 0.0,
+                "p95": 0.0,
+                "topic": self._latency_probe_topic,
+                "interval_sec": self._latency_probe_interval_sec,
+                "window_size": self._latency_probe_window_size,
+            }
+
+        import numpy as np
+
+        sample_array = np.array(samples, dtype=np.float32)
         return {
-            "connected": False,
-            "samples": 0,
-            "min": 0.0,
-            "max": 0.0,
-            "p50": 0.0,
-            "p95": 0.0,
-            "topic": "",
-            "interval_sec": 0.0,
-            "window_size": 0,
+            "connected": bool(self._latency_probe_connected),
+            "samples": int(sample_array.size),
+            "min": float(np.min(sample_array)),
+            "max": float(np.max(sample_array)),
+            "p50": float(np.percentile(sample_array, 50)),
+            "p95": float(np.percentile(sample_array, 95)),
+            "topic": self._latency_probe_topic,
+            "interval_sec": self._latency_probe_interval_sec,
+            "window_size": self._latency_probe_window_size,
         }
     
     def stop(self) -> None:
@@ -361,6 +470,7 @@ class WorkloadManager:
             return
         
         print("正在停止工作负载...")
+        self._stop_latency_probe()
         
         for process in self._processes:
             try:
