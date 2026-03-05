@@ -138,6 +138,50 @@ def parse_args() -> argparse.Namespace:
         help="每次更新执行的梯度步数，默认：1",
     )
     parser.add_argument(
+        "--utd_ratio",
+        "--utd-ratio",
+        type=int,
+        default=1,
+        help="UTD比率：每次训练调用额外执行倍率（effective_steps=gradient_steps*utd_ratio，默认：1）",
+    )
+    parser.add_argument(
+        "--policy_delay",
+        "--policy-delay",
+        type=int,
+        default=1,
+        help="延迟策略更新频率：每多少次critic更新执行1次actor更新（默认：1）",
+    )
+    parser.add_argument(
+        "--critic_loss",
+        "--critic-loss",
+        type=str,
+        choices=["mse", "huber"],
+        default="mse",
+        help="Critic损失类型（mse/huber，默认：mse）",
+    )
+    parser.add_argument(
+        "--grad_clip_norm",
+        "--grad-clip-norm",
+        type=float,
+        default=0.0,
+        help="梯度裁剪阈值（<=0表示关闭，默认：0）",
+    )
+    parser.add_argument(
+        "--target_q_clip",
+        "--target-q-clip",
+        type=float,
+        default=0.0,
+        help="Target Q裁剪阈值（<=0表示关闭，默认：0）",
+    )
+    parser.add_argument(
+        "--use_constraint_weighting",
+        "--use-constraint-weighting",
+        type=int,
+        choices=[0, 1],
+        default=0,
+        help="是否启用约束感知critic loss加权（0/1，默认：0）",
+    )
+    parser.add_argument(
         "--action-noise-type",
         type=str,
         default="ou",
@@ -155,6 +199,168 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.15,
         help="OU噪声theta参数，默认：0.15",
+    )
+    parser.add_argument(
+        "--use_attention",
+        "--use-attention",
+        type=int,
+        choices=[0, 1],
+        default=0,
+        help="是否启用特征注意力（0/1，默认：0）",
+    )
+    parser.add_argument(
+        "--attention_hidden_dim",
+        "--attention-hidden-dim",
+        type=int,
+        default=64,
+        help="Attention隐藏层维度（默认：64）",
+    )
+    parser.add_argument(
+        "--attention_use_layer_norm",
+        "--attention-use-layer-norm",
+        type=int,
+        choices=[0, 1],
+        default=0,
+        help="Attention输出后是否使用LayerNorm（0/1，默认：0）",
+    )
+    parser.add_argument(
+        "--use_per",
+        "--use-per",
+        type=int,
+        choices=[0, 1],
+        default=0,
+        help="是否启用PER（0/1，默认：0）",
+    )
+    parser.add_argument(
+        "--per_alpha",
+        "--per-alpha",
+        type=float,
+        default=0.6,
+        help="PER alpha（默认：0.6）",
+    )
+    parser.add_argument(
+        "--per_beta0",
+        "--per-beta0",
+        "--per_beta_start",
+        "--per-beta-start",
+        dest="per_beta0",
+        type=float,
+        default=0.4,
+        help="PER beta起始值（默认：0.4）",
+    )
+    parser.add_argument(
+        "--per_beta_end",
+        "--per-beta-end",
+        type=float,
+        default=1.0,
+        help="PER beta结束值（默认：1.0）",
+    )
+    parser.add_argument(
+        "--per_eps",
+        "--per-eps",
+        type=float,
+        default=1e-6,
+        help="PER epsilon（默认：1e-6）",
+    )
+    parser.add_argument(
+        "--per_clip_max",
+        "--per-clip-max",
+        type=float,
+        default=0.0,
+        help="PER priority裁剪上限（<=0 表示关闭，默认：0）",
+    )
+    parser.add_argument(
+        "--per_mix_uniform_ratio",
+        "--per-mix-uniform-ratio",
+        type=float,
+        default=0.0,
+        help="PER混合均匀采样比例（0~1，默认：0）",
+    )
+    parser.add_argument(
+        "--per_constraint_priority",
+        "--per-constraint-priority",
+        type=int,
+        choices=[0, 1],
+        default=0,
+        help="PER是否启用约束调制priority（0/1，默认：0）",
+    )
+    parser.add_argument(
+        "--per_constraint_scale",
+        "--per-constraint-scale",
+        type=float,
+        default=1.0,
+        help="PER约束调制缩放系数（默认：1.0）",
+    )
+    parser.add_argument(
+        "--per_beta_anneal_steps",
+        "--per-beta-anneal-steps",
+        type=int,
+        default=0,
+        help="PER beta退火步数（默认：0，表示使用total-timesteps）",
+    )
+    parser.add_argument(
+        "--use_nstep",
+        "--use-nstep",
+        type=int,
+        choices=[0, 1],
+        default=0,
+        help="是否启用N-step return（0/1，默认：0）",
+    )
+    parser.add_argument(
+        "--n_step",
+        "--n-step",
+        type=int,
+        default=5,
+        help="N-step长度（默认：5）",
+    )
+    parser.add_argument(
+        "--n_step_adaptive",
+        "--n-step-adaptive",
+        type=int,
+        choices=[0, 1],
+        default=0,
+        help="是否启用自适应N-step（高done比例时降半，0/1，默认：0）",
+    )
+    parser.add_argument(
+        "--constraint_mode",
+        "--constraint-mode",
+        type=str,
+        default="none",
+        choices=["none", "lagrangian_hinge"],
+        help="时延约束模式（none/lagrangian_hinge，默认：none）",
+    )
+    parser.add_argument(
+        "--latency_limit_ms",
+        "--latency-limit-ms",
+        type=float,
+        default=80.0,
+        help="时延阈值（ms，默认：80.0）",
+    )
+    parser.add_argument(
+        "--lambda_lr",
+        "--lambda-lr",
+        type=float,
+        default=0.01,
+        help="Lagrangian λ更新学习率（默认：0.01）",
+    )
+    parser.add_argument(
+        "--penalty_scale",
+        "--penalty-scale",
+        type=float,
+        default=1.0,
+        help="约束惩罚缩放系数（默认：1.0）",
+    )
+    parser.add_argument(
+        "--constraint_lambda_init",
+        type=float,
+        default=1.0,
+        help="约束λ初始值（默认：1.0）",
+    )
+    parser.add_argument(
+        "--constraint_lambda_max",
+        type=float,
+        default=100.0,
+        help="约束λ上限（默认：100.0）",
     )
     parser.add_argument(
         "--seed",
@@ -265,6 +471,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=3,
         help="最多保留多少个Mosquitto日志文件（默认：3）",
+    )
+    parser.add_argument(
+        "--replay-debug-freq",
+        type=int,
+        default=100,
+        help="Replay调试指标记录频率（步，默认：100）",
     )
     return parser.parse_args()
 
@@ -530,6 +742,12 @@ class ActionThroughputLoggerWrapper(gym.Env):
                         "latency_probe_samples",
                         "latency_probe_min",
                         "latency_probe_max",
+                        "constraint_lambda",
+                        "constraint_penalty",
+                        "latency_limit_ms",
+                        "latency_violation_ms",
+                        "constraint_metric_ms",
+                        "unsafe",
                     ]
                 )
                 # 注意：未来可以添加更多状态指标到CSV，如延迟等
@@ -754,6 +972,12 @@ class ActionThroughputLoggerWrapper(gym.Env):
                 reward_tp_step = reward_components.get("throughput_step", "")
                 reward_lat_base = reward_components.get("latency_base", "")
                 reward_lat_step = reward_components.get("latency_step", "")
+                constraint_lambda = reward_components.get("constraint_lambda", "")
+                constraint_penalty = reward_components.get("constraint_penalty", "")
+                latency_limit_ms = reward_components.get("latency_limit_ms", "")
+                latency_violation_ms = reward_components.get("latency_violation_ms", "")
+                constraint_metric_ms = reward_components.get("constraint_metric_ms", "")
+                unsafe = info.get("unsafe", reward_components.get("unsafe", ""))
                 # 将action转换为列表（如果是numpy数组）
                 action_list = action.tolist() if hasattr(action, 'tolist') else list(action)
                 # 行数据：步数、episode、11个action值（归一化）、11个解码后的配置值、吞吐量、奖励
@@ -781,6 +1005,12 @@ class ActionThroughputLoggerWrapper(gym.Env):
                         latency_probe_samples,
                         latency_probe_min,
                         latency_probe_max,
+                        constraint_lambda,
+                        constraint_penalty,
+                        latency_limit_ms,
+                        latency_violation_ms,
+                        constraint_metric_ms,
+                        unsafe,
                     ]
                 )
                 with open(self.csv_path, 'a', newline='') as f:
@@ -995,6 +1225,39 @@ class ProgressBarCallback(BaseCallback):
             print(f"\n训练完成！总步数: {self.num_timesteps:,}")
 
 
+class ReplayDebugCallback(BaseCallback):
+    """
+    周期性记录 replay buffer 内部统计，便于验证 PER/N-step 是否生效。
+    """
+
+    def __init__(self, check_freq: int = 100, verbose: int = 0):
+        super().__init__(verbose)
+        self.check_freq = max(1, int(check_freq))
+        self.last_check = -1
+
+    def _on_step(self) -> bool:
+        if self.num_timesteps - self.last_check < self.check_freq:
+            return True
+        self.last_check = self.num_timesteps
+
+        replay_buffer = getattr(self.model, "replay_buffer", None)
+        if replay_buffer is None or not hasattr(replay_buffer, "get_debug_stats"):
+            return True
+
+        try:
+            stats = replay_buffer.get_debug_stats()
+        except Exception:
+            return True
+
+        for key, value in stats.items():
+            if isinstance(value, (int, float, np.floating, np.integer)):
+                self.logger.record(f"train/{key}", float(value))
+
+        if self.verbose > 0:
+            print(f"[ReplayDebug] step={self.num_timesteps}, stats={stats}")
+        return True
+
+
 def record_default_baseline(env, save_dir: Path) -> None:
     """
     在训练开始前记录默认配置下的基线性能。
@@ -1074,6 +1337,12 @@ def main() -> None:
         pass
 
     env_cfg = EnvConfig()
+    env_cfg.constraint_mode = str(args.constraint_mode)
+    env_cfg.latency_limit_ms = float(args.latency_limit_ms)
+    env_cfg.lambda_lr = float(args.lambda_lr)
+    env_cfg.penalty_scale = float(args.penalty_scale)
+    env_cfg.constraint_lambda_init = float(args.constraint_lambda_init)
+    env_cfg.constraint_lambda_max = float(args.constraint_lambda_max)
     
     # 创建工作负载管理器（必须启用，在创建环境之前）
     workload = None
@@ -1239,6 +1508,12 @@ def main() -> None:
     # 记录默认配置下的基线性能（训练前）
     record_default_baseline(env, Path(args.save_dir))
 
+    per_beta_anneal_steps = (
+        int(args.per_beta_anneal_steps)
+        if int(args.per_beta_anneal_steps) > 0
+        else int(args.total_timesteps)
+    )
+
     model = make_ddpg_model(
         env=env,
         tau=args.tau,
@@ -1251,11 +1526,39 @@ def main() -> None:
         learning_starts=args.learning_starts,
         train_freq=args.train_freq,
         gradient_steps=args.gradient_steps,
+        utd_ratio=args.utd_ratio,
+        policy_delay=args.policy_delay,
+        critic_loss=args.critic_loss,
+        grad_clip_norm=args.grad_clip_norm,
+        target_q_clip=args.target_q_clip,
+        use_constraint_weighting=bool(args.use_constraint_weighting),
         action_noise_type=args.action_noise_type,
         action_noise_sigma=args.action_noise_sigma,
         action_noise_theta=args.action_noise_theta,
+        use_attention=bool(args.use_attention),
+        attention_hidden_dim=args.attention_hidden_dim,
+        attention_use_layer_norm=bool(args.attention_use_layer_norm),
+        use_per=bool(args.use_per),
+        per_alpha=args.per_alpha,
+        per_beta0=args.per_beta0,
+        per_beta_end=args.per_beta_end,
+        per_eps=args.per_eps,
+        per_clip_max=args.per_clip_max,
+        per_mix_uniform_ratio=args.per_mix_uniform_ratio,
+        per_constraint_priority=bool(args.per_constraint_priority),
+        per_constraint_scale=args.per_constraint_scale,
+        per_beta_anneal_steps=per_beta_anneal_steps,
+        use_nstep=bool(args.use_nstep),
+        n_step=args.n_step,
+        n_step_adaptive=bool(args.n_step_adaptive),
         seed=args.seed,
     )
+    if args.use_attention:
+        actor_params = sum(p.numel() for p in model.actor.parameters())
+        critic_params = sum(p.numel() for p in model.critic.parameters())
+        print("[Attention] 已启用 FeatureWiseAttentionExtractor")
+        print(f"[Attention] Actor参数量: {actor_params:,}, Critic参数量: {critic_params:,}")
+        print(f"[Attention] Actor结构: {model.actor}")
 
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -1313,6 +1616,10 @@ def main() -> None:
         workload=workload,
         check_freq=1,  # 每步都检查（确保Broker重启后立即恢复工作负载）
     )
+    replay_debug_callback = ReplayDebugCallback(
+        check_freq=args.replay_debug_freq,
+        verbose=0,
+    )
     
     # 创建Mosquitto日志清理callback（可选）
     callbacks = [
@@ -1320,6 +1627,7 @@ def main() -> None:
         checkpoint_cleanup_callback,
         progress_callback,
         workload_health_callback,
+        replay_debug_callback,
     ]
     
     if args.cleanup_mosquitto_logs:
@@ -1345,7 +1653,33 @@ def main() -> None:
     print(f"Learning starts: {args.learning_starts}")
     print(f"Train freq: {args.train_freq} step")
     print(f"Gradient steps: {args.gradient_steps}")
+    print(
+        f"Training update: utd_ratio={args.utd_ratio}, "
+        f"policy_delay={args.policy_delay}, critic_loss={args.critic_loss}, "
+        f"grad_clip_norm={args.grad_clip_norm}, target_q_clip={args.target_q_clip}, "
+        f"use_constraint_weighting={bool(args.use_constraint_weighting)}"
+    )
     print(f"探索噪声: {args.action_noise_type} (sigma={args.action_noise_sigma}, theta={args.action_noise_theta})")
+    print(
+        f"Attention: {'启用' if args.use_attention else '关闭'} "
+        f"(hidden={args.attention_hidden_dim}, layer_norm={bool(args.attention_use_layer_norm)})"
+    )
+    print(
+        f"PER: {'启用' if args.use_per else '关闭'} "
+        f"(alpha={args.per_alpha}, beta_start={args.per_beta0}, beta_end={args.per_beta_end}, "
+        f"eps={args.per_eps}, clip_max={args.per_clip_max}, mix_uniform_ratio={args.per_mix_uniform_ratio}, "
+        f"constraint_priority={bool(args.per_constraint_priority)}, constraint_scale={args.per_constraint_scale}, "
+        f"anneal_steps={per_beta_anneal_steps})"
+    )
+    print(
+        f"N-step: {'启用' if args.use_nstep else '关闭'} "
+        f"(n_step={args.n_step}, adaptive={bool(args.n_step_adaptive)})"
+    )
+    print(
+        f"约束模式: {args.constraint_mode}, latency_limit_ms={args.latency_limit_ms}, "
+        f"lambda_lr={args.lambda_lr}, penalty_scale={args.penalty_scale}, "
+        f"lambda_init={args.constraint_lambda_init}, lambda_max={args.constraint_lambda_max}"
+    )
     if args.limit_action_log:
         print(f"Action日志记录间隔: 每{args.action_log_interval}步（节省磁盘空间）")
     print()

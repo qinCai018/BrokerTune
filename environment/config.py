@@ -142,6 +142,14 @@ class EnvConfig:
     reward_delta_clip: float = 2.0
     reward_use_tanh: bool = True
     reward_latency_floor_norm: float = 0.01
+
+    # 时延约束（默认关闭以保持向后兼容）
+    constraint_mode: str = "none"  # none | lagrangian_hinge
+    latency_limit_ms: float = 80.0
+    lambda_lr: float = 0.01
+    penalty_scale: float = 1.0
+    constraint_lambda_init: float = 1.0
+    constraint_lambda_max: float = 100.0
     failed_step_penalty: float = -3.0
     max_consecutive_failures: int = 3
     latency_fallback_p50_ms: float = 20.0

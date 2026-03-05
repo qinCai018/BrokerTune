@@ -55,3 +55,44 @@ def test_failure_transition_truncates_after_threshold():
     assert truncated2 is True
     assert info1["consecutive_failures"] == 1
     assert info2["consecutive_failures"] == 2
+    assert info1["terminated"] is False
+    assert info1["truncated"] is False
+    assert info1["done"] is False
+    assert info2["truncated"] is True
+    assert info2["done"] is True
+
+
+def test_lagrangian_hinge_constraint_penalizes_latency_violation():
+    cfg = EnvConfig(
+        constraint_mode="lagrangian_hinge",
+        latency_limit_ms=80.0,
+        lambda_lr=0.2,
+        penalty_scale=1.0,
+        constraint_lambda_init=1.0,
+        constraint_lambda_max=100.0,
+    )
+    env = MosquittoBrokerEnv(cfg=cfg)
+    env._constraint_lambda = cfg.constraint_lambda_init
+
+    prev = _state(throughput_norm=1.0, latency_p50_norm=0.50)
+    high_latency = _state(throughput_norm=1.0, latency_p50_norm=0.50)
+    high_latency[6] = 1.20  # p95 = 120ms, exceed 80ms
+
+    low_latency = _state(throughput_norm=1.0, latency_p50_norm=0.50)
+    low_latency[6] = 0.60  # p95 = 60ms
+
+    env._compute_reward(prev_state=prev, next_state=high_latency)
+    violated = dict(env._last_reward_components)
+    lambda_after_violation = violated["constraint_lambda"]
+
+    env._compute_reward(prev_state=prev, next_state=low_latency)
+    non_violated = dict(env._last_reward_components)
+
+    assert violated["latency_violation_ms"] > 0.0
+    assert violated["constraint_penalty"] > 0.0
+    assert bool(violated["unsafe"]) is True
+    assert lambda_after_violation >= cfg.constraint_lambda_init
+
+    assert non_violated["latency_violation_ms"] == 0.0
+    assert non_violated["constraint_penalty"] == 0.0
+    assert bool(non_violated["unsafe"]) is False

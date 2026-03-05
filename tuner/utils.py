@@ -10,7 +10,6 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Optional, Union
 
-from stable_baselines3 import DDPG
 from stable_baselines3.common.noise import (
     NormalActionNoise,
     OrnsteinUhlenbeckActionNoise,
@@ -18,6 +17,11 @@ from stable_baselines3.common.noise import (
 import numpy as np
 
 from environment import EnvConfig, MosquittoBrokerEnv
+from model import (
+    EnhancedDDPG,
+    FeatureWiseAttentionExtractor,
+    PrioritizedNStepReplayBuffer,
+)
 
 
 def make_env(cfg: Optional[EnvConfig] = None, workload_manager: Optional[Any] = None) -> MosquittoBrokerEnv:
@@ -46,11 +50,33 @@ def make_ddpg_model(
     learning_starts: int = 1_000,
     train_freq: int = 1,
     gradient_steps: int = 1,
+    utd_ratio: int = 1,
+    policy_delay: int = 1,
+    critic_loss: str = "mse",
+    grad_clip_norm: float = 0.0,
+    target_q_clip: float = 0.0,
+    use_constraint_weighting: bool = False,
     action_noise_type: str = "ou",
     action_noise_sigma: float = 0.2,
     action_noise_theta: float = 0.15,
+    use_attention: bool = False,
+    attention_hidden_dim: int = 64,
+    attention_use_layer_norm: bool = False,
+    use_per: bool = False,
+    per_alpha: float = 0.6,
+    per_beta0: float = 0.4,
+    per_beta_end: float = 1.0,
+    per_eps: float = 1e-6,
+    per_clip_max: float = 0.0,
+    per_mix_uniform_ratio: float = 0.0,
+    per_constraint_priority: bool = False,
+    per_constraint_scale: float = 1.0,
+    per_beta_anneal_steps: int = 100_000,
+    use_nstep: bool = False,
+    n_step: int = 5,
+    n_step_adaptive: bool = False,
     seed: Optional[int] = None,
-) -> DDPG:
+) -> EnhancedDDPG:
     """
     使用默认 MlpPolicy 创建一个 DDPG 模型。
     
@@ -67,6 +93,12 @@ def make_ddpg_model(
         learning_starts: 多少步后开始梯度更新
         train_freq: 每多少步更新一次网络
         gradient_steps: 每次更新执行多少次梯度步
+        utd_ratio: UTD比率，每次训练调用额外执行倍率（effective_steps=gradient_steps*utd_ratio）
+        policy_delay: actor/target延迟更新频率（每多少次critic更新执行1次actor更新）
+        critic_loss: critic损失类型（mse/huber）
+        grad_clip_norm: 梯度裁剪阈值（<=0表示关闭）
+        target_q_clip: target Q裁剪阈值（<=0表示关闭）
+        use_constraint_weighting: 是否启用约束感知loss加权
         action_noise_type: 探索噪声类型（ou/normal/none）
         action_noise_sigma: 动作噪声标准差
         action_noise_theta: OU噪声theta
@@ -122,7 +154,36 @@ def make_ddpg_model(
         else:
             learning_rate = default_lr
 
-    model = DDPG(
+    policy_kwargs = {}
+    if use_attention:
+        policy_kwargs["features_extractor_class"] = FeatureWiseAttentionExtractor
+        policy_kwargs["features_extractor_kwargs"] = {
+            "attention_hidden_dim": int(attention_hidden_dim),
+            "attention_use_layer_norm": bool(attention_use_layer_norm),
+        }
+
+    replay_buffer_class = None
+    replay_buffer_kwargs = None
+    if use_per or use_nstep:
+        replay_buffer_class = PrioritizedNStepReplayBuffer
+        replay_buffer_kwargs = {
+            "use_per": bool(use_per),
+            "per_alpha": float(per_alpha),
+            "per_beta0": float(per_beta0),
+            "per_beta_end": float(per_beta_end),
+            "per_eps": float(per_eps),
+            "per_clip_max": float(per_clip_max),
+            "per_mix_uniform_ratio": float(per_mix_uniform_ratio),
+            "per_constraint_priority": bool(per_constraint_priority),
+            "per_constraint_scale": float(per_constraint_scale),
+            "per_beta_anneal_steps": int(per_beta_anneal_steps),
+            "use_n_step": bool(use_nstep),
+            "n_step": int(n_step),
+            "n_step_adaptive": bool(n_step_adaptive),
+            "gamma": float(gamma),
+        }
+
+    model = EnhancedDDPG(
         policy="MlpPolicy",
         env=env,
         action_noise=action_noise,
@@ -134,6 +195,15 @@ def make_ddpg_model(
         learning_starts=int(learning_starts),
         train_freq=(int(train_freq), "step"),
         gradient_steps=int(gradient_steps),
+        utd_ratio=int(utd_ratio),
+        policy_delay=int(policy_delay),
+        critic_loss=str(critic_loss),
+        grad_clip_norm=float(grad_clip_norm),
+        target_q_clip=float(target_q_clip),
+        use_constraint_weighting=bool(use_constraint_weighting),
+        replay_buffer_class=replay_buffer_class,
+        replay_buffer_kwargs=replay_buffer_kwargs,
+        policy_kwargs=policy_kwargs if policy_kwargs else None,
         verbose=1,
         device=device,
         seed=seed,
@@ -141,15 +211,25 @@ def make_ddpg_model(
     return model
 
 
-def save_model(model: DDPG, save_path: Union[str, Path]) -> None:
+def save_model(model: EnhancedDDPG, save_path: Union[str, Path]) -> None:
     save_path = Path(save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
     model.save(str(save_path))
 
 
-def load_model(load_path: Union[str, Path], env: MosquittoBrokerEnv, device: str = "cpu") -> DDPG:
-    return DDPG.load(
-        path=str(load_path),
-        env=env,
-        device=device,
-    )
+def load_model(load_path: Union[str, Path], env: MosquittoBrokerEnv, device: str = "cpu") -> EnhancedDDPG:
+    try:
+        return EnhancedDDPG.load(
+            path=str(load_path),
+            env=env,
+            device=device,
+        )
+    except Exception:
+        # 回退兼容历史模型
+        from stable_baselines3 import DDPG
+
+        return DDPG.load(
+            path=str(load_path),
+            env=env,
+            device=device,
+        )

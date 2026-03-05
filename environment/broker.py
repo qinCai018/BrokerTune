@@ -89,6 +89,7 @@ class MosquittoBrokerEnv(gym.Env):
         self._consecutive_failures = 0
         self._restart_count = 0
         self._last_reward_components: Dict[str, float] = {}
+        self._constraint_lambda = float(self.cfg.constraint_lambda_init)
 
     # ---------- 核心 Gym 接口 ----------
     def reset(self, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None) -> Tuple[np.ndarray, Dict[str, Any]]:
@@ -490,6 +491,9 @@ class MosquittoBrokerEnv(gym.Env):
         info: Dict[str, Any] = {
             "knobs": knobs,
             "step": self._step_count,
+            "terminated": bool(terminated),
+            "truncated": bool(truncated),
+            "done": bool(terminated or truncated),
             "throughput_norm": float(next_state[1]),
             "throughput_msg_per_sec": throughput_msg_per_sec,
             "latency_p50_ms": latency_p50_ms,
@@ -501,6 +505,7 @@ class MosquittoBrokerEnv(gym.Env):
             "restart_count": self._restart_count,
             "consecutive_failures": self._consecutive_failures,
             "reward_components": dict(self._last_reward_components),
+            "unsafe": bool(self._last_reward_components.get("unsafe", 0.0)),
             "latency_source": latency_source,
             "latency_probe_connected": bool(probe_debug.get("connected", False)),
             "latency_probe_samples": int(probe_debug.get("samples", 0)),
@@ -538,6 +543,9 @@ class MosquittoBrokerEnv(gym.Env):
         info: Dict[str, Any] = {
             "step": self._step_count,
             "knobs": knobs or {},
+            "terminated": bool(terminated),
+            "truncated": bool(truncated),
+            "done": bool(terminated or truncated),
             "error_reason": reason,
             "error": str(error),
             "consecutive_failures": self._consecutive_failures,
@@ -774,14 +782,36 @@ class MosquittoBrokerEnv(gym.Env):
                 delta_latency_step, -self.cfg.reward_delta_clip, self.cfg.reward_delta_clip
             )
 
-        reward = self.cfg.reward_scale * (
+        reward_base = self.cfg.reward_scale * (
             self.cfg.reward_weight_base * delta_throughput_base
             + self.cfg.reward_weight_step * delta_throughput_step
             + self.cfg.reward_weight_latency_base * delta_latency_base
             + self.cfg.reward_weight_latency_step * delta_latency_step
         )
 
-        reward = float(reward)
+        constraint_penalty = 0.0
+        constraint_metric_ms = float(next_state[6]) * 100.0 if len(next_state) > 6 else float(next_state[5]) * 100.0
+        latency_limit_ms = max(float(self.cfg.latency_limit_ms), eps)
+        latency_violation_ms = 0.0
+        unsafe = False
+
+        if str(self.cfg.constraint_mode).lower() == "lagrangian_hinge":
+            latency_violation_ms = max(0.0, constraint_metric_ms - latency_limit_ms)
+            violation_ratio = latency_violation_ms / latency_limit_ms
+            hinge_penalty = violation_ratio**2
+            constraint_penalty = float(self._constraint_lambda * self.cfg.penalty_scale * hinge_penalty)
+            reward = float(reward_base - constraint_penalty)
+            unsafe = latency_violation_ms > 0.0
+            self._constraint_lambda = float(
+                np.clip(
+                    self._constraint_lambda + self.cfg.lambda_lr * violation_ratio,
+                    0.0,
+                    float(self.cfg.constraint_lambda_max),
+                )
+            )
+        else:
+            reward = float(reward_base)
+
         if np.isnan(reward) or np.isinf(reward):
             reward = 0.0
 
@@ -791,6 +821,13 @@ class MosquittoBrokerEnv(gym.Env):
             "throughput_step": float(delta_throughput_step),
             "latency_base": float(delta_latency_base),
             "latency_step": float(delta_latency_step),
+            "reward_base": float(reward_base),
+            "constraint_lambda": float(self._constraint_lambda),
+            "constraint_penalty": float(constraint_penalty),
+            "constraint_metric_ms": float(constraint_metric_ms),
+            "latency_limit_ms": float(latency_limit_ms),
+            "latency_violation_ms": float(latency_violation_ms),
+            "unsafe": float(1.0 if unsafe else 0.0),
             "reward": float(reward),
         }
 
@@ -813,6 +850,10 @@ class MosquittoBrokerEnv(gym.Env):
                   f"Δ_tp_step: {delta_throughput_step:+.6f}, "
                   f"Δ_lat_base: {delta_latency_base:+.6f}, "
                   f"Δ_lat_step: {delta_latency_step:+.6f}, "
+                  f"约束罚分: {constraint_penalty:.6f}, "
+                  f"约束λ: {self._constraint_lambda:.6f}, "
+                  f"P95: {constraint_metric_ms:.2f}ms/{latency_limit_ms:.2f}ms, "
+                  f"unsafe: {unsafe}, "
                   f"奖励类型: {reward_type}, "
                   f"总奖励: {reward:.6f}")
 
