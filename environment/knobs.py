@@ -526,7 +526,7 @@ def apply_knobs(knobs: Dict[str, Any], dry_run: bool = None, force_restart: bool
         # 方法1: 尝试使用 systemctl stop（如果服务正在运行）
         try:
             result = subprocess.run(
-                ["systemctl", "stop", "mosquitto"],
+                ["systemctl", "--no-ask-password", "stop", "mosquitto"],
                 capture_output=True,
                 text=True,
                 timeout=10
@@ -541,7 +541,7 @@ def apply_knobs(knobs: Dict[str, Any], dry_run: bool = None, force_restart: bool
         try:
             # 先尝试优雅停止（SIGTERM）
             subprocess.run(
-                ["pkill", "-TERM", "-f", "mosquitto"],
+                ["pkill", "-TERM", "-x", "mosquitto"],
                 capture_output=True,
                 timeout=5
             )
@@ -549,7 +549,7 @@ def apply_knobs(knobs: Dict[str, Any], dry_run: bool = None, force_restart: bool
             
             # 检查是否还有进程在运行
             result = subprocess.run(
-                ["pgrep", "-f", "mosquitto"],
+                ["pgrep", "-x", "mosquitto"],
                 capture_output=True,
                 text=True,
                 timeout=2
@@ -558,7 +558,7 @@ def apply_knobs(knobs: Dict[str, Any], dry_run: bool = None, force_restart: bool
                 # 如果还有进程，强制终止（SIGKILL）
                 print("[apply_knobs] 仍有进程运行，强制终止...")
                 subprocess.run(
-                    ["pkill", "-KILL", "-f", "mosquitto"],
+                    ["pkill", "-KILL", "-x", "mosquitto"],
                     capture_output=True,
                     timeout=5
                 )
